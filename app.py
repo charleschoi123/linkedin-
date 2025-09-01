@@ -386,6 +386,9 @@ def process():
     if not MODEL_API_KEY:
         return "缺少环境变量 MODEL_API_KEY / MODEL_BASE_URL", 400
 
+    # 先声明 global，再使用
+    global MODEL_NAME
+
     files = request.files.getlist("files")
     role = request.form.get("role",""); min_years = request.form.get("min_years","")
     must = request.form.get("must",""); nice = request.form.get("nice","")
@@ -394,7 +397,8 @@ def process():
 
     model_name = request.form.get("model_name", MODEL_NAME)
     if model_name:
-        global MODEL_NAME; MODEL_NAME = model_name
+        MODEL_NAME = model_name
+
 
 
     try:
