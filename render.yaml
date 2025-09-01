@@ -1,0 +1,21 @@
+# render.yaml
+services:
+  - type: web
+    name: alsos-sourcing-mvp
+    env: python
+    plan: free
+    rootDir: .
+    buildCommand: pip install --upgrade pip wheel setuptools && pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --timeout 120
+    healthCheckPath: /
+    autoDeploy: true
+    envVars:
+      - key: MODEL_BASE_URL
+        value: https://api.deepseek.com
+      - key: MODEL_NAME
+        value: deepseek-chat
+      - key: MAX_WORKERS
+        value: "3"
+      # 这个 Key 请在 Render 控制台里以 Secret 方式填，不要写在仓库里
+      # - key: MODEL_API_KEY
+      #   sync: false
