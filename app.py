@@ -396,6 +396,7 @@ def process():
     if model_name:
         global MODEL_NAME; MODEL_NAME = model_name
 
+
     try:
         workers = int(request.form.get("workers", MAX_WORKERS)); workers = max(1, min(8, workers))
     except Exception:
