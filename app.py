@@ -1,8 +1,8 @@
-# app.py (no-pandas)
 import os, io, re, json, uuid, zipfile, time, hashlib, logging, csv
 from datetime import datetime
 from typing import List, Dict, Any, Optional
-from flask import Flask, request, render_template_string, send_file, redirect, url_for
+from queue import Queue
+from flask import Flask, request, render_template_string, send_file, redirect, url_for, Response
 import requests
 
 # ------- Optional parsers -------
@@ -24,8 +24,8 @@ except Exception:
 # ------- Config -------
 MODEL_API_KEY  = os.getenv("MODEL_API_KEY", "")
 MODEL_BASE_URL = os.getenv("MODEL_BASE_URL", "https://api.openai.com")  # 可指向 DeepSeek 的 OpenAI 兼容 Base URL
-MODEL_NAME     = os.getenv("MODEL_NAME", "gpt-4o-mini")
-MAX_WORKERS    = int(os.getenv("MAX_WORKERS", "3"))  # Render 免费层建议 2~4
+MODEL_NAME     = os.getenv("MODEL_NAME", "deepseek-chat")
+MAX_WORKERS    = int(os.getenv("MAX_WORKERS", "2"))  # 默认2，更稳
 MAX_CHARS_EACH = int(os.getenv("MAX_CHARS_EACH", "12000"))
 TIMEOUT_SEC    = int(os.getenv("TIMEOUT_SEC", "90"))
 RETRIES        = int(os.getenv("RETRIES", "2"))
@@ -37,12 +37,13 @@ app.config["MAX_CONTENT_LENGTH"] = 300 * 1024 * 1024  # 300MB
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 REPORTS: Dict[str, Dict[str, Any]] = {}
+JOBS: Dict[str, Dict[str, Any]] = {}   # rid -> {"q": Queue, "done": False, "title": str}
 
-# ------- Inline templates (同之前) -------
+# ------- HTML Templates -------
 INDEX_HTML = """<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>Alsos Talent · 合规AI自动化寻访（MVP）</title>
 <style>
- body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial; margin:0; background:#0b0f14; color:#e3e8f2;}
+ body { font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial;margin:0;background:#0b0f14;color:#e3e8f2;}
  .wrap { max-width: 980px; margin: 32px auto; padding: 0 16px; }
  h1 { font-size: 22px; margin: 12px 0 18px; }
  .card { background:#121824; border:1px solid #1e2633; border-radius:16px; padding:20px; margin-bottom:18px; }
@@ -55,12 +56,12 @@ INDEX_HTML = """<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8"/><met
  a{ color:#7aa0ff; text-decoration:none;}
 </style></head><body><div class="wrap">
   <h1>Alsos Talent · 合规AI自动化寻访（MVP）</h1>
-  <div class="card"><p class="muted">说明：本工具<strong>不做</strong>任何对 LinkedIn/猎聘 的自动登录、自动点开或爬取行为；仅对你<strong>合规导出</strong>的 ZIP/PDF/HTML/CSV/文本做AI分析与排序，导出《重点联系名单》和《不合适汇总》Excel。</p></div>
+  <div class="card"><p class="muted">说明：本工具<strong>不做</strong>对 LinkedIn/猎聘 的自动点开或抓取；仅对你<strong>合规导出</strong>的 ZIP/PDF/HTML/CSV/文本做AI分析、排序并导出Excel。</p></div>
   <form action="/process" method="post" enctype="multipart/form-data">
     <div class="card"><h3>上传候选集（支持多文件）</h3>
       <label>选择文件（.zip .pdf .html/.htm .docx .txt .csv）：</label>
       <input type="file" name="files" multiple required />
-      <small>直接上传 Recruiter Lite 导出的 ZIP（每包25人）或混合上传均可。</small>
+      <small>可直接上传 Recruiter Lite 25人/包的 ZIP（一次多包）。</small>
     </div>
     <div class="card"><h3>岗位/筛选要求</h3>
       <div class="row">
@@ -68,23 +69,25 @@ INDEX_HTML = """<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8"/><met
         <div><label>最低年限</label><input type="text" name="min_years" placeholder="例如：8 或 10-15"/></div>
       </div>
       <div class="row">
-        <div><label>Must-have关键词（逗号分隔）</label><input type="text" name="must" placeholder="例如：ADC, 临床前, 抗体工程, 领导跨职能团队"/></div>
+        <div><label>Must-have关键词（逗号分隔）</label><input type="text" name="must" placeholder="例如：ADC, 临床前, 抗体工程, 跨职能领导"/></div>
         <div><label>Nice-to-have关键词（逗号分隔）</label><input type="text" name="nice" placeholder="例如：PROTAC, siRNA, 双特异, 海外并购"/></div>
       </div>
       <div class="row">
         <div><label>学历/学校偏好（选填）</label><input type="text" name="edu" placeholder="例如：博士优先；QS200以上；985/211"/></div>
         <div><label>地域/签证等限制（选填）</label><input type="text" name="location" placeholder="例如：上海/苏州；可出差；英文流利"/></div>
       </div>
-      <label>补充说明（用来指导AI评估）</label><textarea name="note" placeholder="例如：优先有从PCC→IND推进经验；有license in/out实操；避免频繁跳槽。"></textarea>
+      <label>补充说明（用于指导AI评估）</label><textarea name="note" placeholder="例如：优先有从PCC→IND推进经验；有license in/out经验；避免频繁跳槽。"></textarea>
     </div>
     <div class="card"><h3>模型与并发</h3>
       <div class="row">
         <div><label>模型名称 <small>(默认 {{model_name}})</small></label><input type="text" name="model_name" value="{{model_name}}"/></div>
         <div><label>每批次并发 <small>(默认 {{max_workers}})</small></label><input type="text" name="workers" value="{{max_workers}}"/></div>
       </div>
-      <small>需在 Render 环境变量配置：MODEL_API_KEY / MODEL_BASE_URL / MODEL_NAME。</small>
+      <small>Render 环境变量需配置：MODEL_API_KEY / MODEL_BASE_URL / MODEL_NAME。</small>
     </div>
-    <div class="card"><button class="btn" type="submit">开始分析（生成Excel清单）</button></div>
+    <div class="card"><button class="btn" type="submit">开始分析（生成Excel清单）</button>
+      <small>提交后会跳到“实时报告”页面，边分析边输出。</small>
+    </div>
   </form>
   <div class="card"><h3>历史报告</h3>
     {% if reports %}{% for r in reports %}
@@ -95,6 +98,33 @@ INDEX_HTML = """<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8"/><met
     {% endfor %}{% else %}<div class="muted">暂无</div>{% endif %}
   </div>
   <div class="muted">© Alsos Talent · 合规AI寻访MVP</div>
+</div></body></html>"""
+
+STREAM_HTML = """<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>实时报告 {{rid}}</title>
+<style>
+ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial;background:#0b0f14;color:#e3e8f2;}
+ .wrap{max-width:980px;margin:24px auto;padding:0 16px;}
+ .card{background:#121824;border:1px solid #1e2633;border-radius:16px;padding:18px;margin-bottom:16px;}
+ .muted{color:#93a1b7;font-size:12px}
+ pre{white-space:pre-wrap;word-break:break-word;background:#0b1018;border:1px solid #223044;border-radius:12px;padding:12px;min-height:180px}
+ a{color:#7aa0ff;text-decoration:none}
+</style></head><body><div class="wrap">
+  <div class="card">
+    <div>任务 <strong>{{rid}}</strong> · 实时报告 <a href="/">返回</a></div>
+    <div class="muted">本页会自动滚动输出；完成后会给出“下载Excel”和“查看榜单”。</div>
+  </div>
+  <div class="card">
+    <pre id="log">🔵 初始化中…</pre>
+  </div>
+  <script>
+    const log = document.getElementById('log');
+    const es = new EventSource('/events/{{rid}}');
+    function append(t){ log.textContent += '\\n' + t; log.scrollTop = log.scrollHeight; }
+    es.onmessage = (e)=>{ append(e.data); }
+    es.onerror = ()=>{ append('⚠️ 连接中断，稍后自动重试或手动刷新本页。'); };
+  </script>
 </div></body></html>"""
 
 RESULTS_HTML = """<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
@@ -324,10 +354,7 @@ def to_excel(rows:List[Dict[str,Any]])->io.BytesIO:
     wb = Workbook()
     ws = wb.active; ws.title = "候选清单"
 
-    # 表头
     ws.append(EXCEL_COLUMNS)
-
-    # 数据
     for r in rows:
         ws.append([
             r.get("name",""),
@@ -345,13 +372,11 @@ def to_excel(rows:List[Dict[str,Any]])->io.BytesIO:
             r.get("remarks",""),
         ])
 
-    # 下拉验证：第4列
     dv = DataValidation(type="list", formula1='"A+,A,B,C"', allow_blank=True,
                         showErrorMessage=True, errorTitle="输入限制", error="请选择 A+ / A / B / C")
     ws.add_data_validation(dv)
     dv.add(f"D2:D5000")
 
-    # 第二个 sheet：填写说明
     ws2 = wb.create_sheet("填写说明")
     ws2.append(["字段","说明"])
     instructions = [
@@ -362,11 +387,11 @@ def to_excel(rows:List[Dict[str,Any]])->io.BytesIO:
         "办公电话（无则留空）",
         "手机（无则留空）",
         "邮箱（无则留空）",
-        "年龄估算：仅当识别到“本科入学年份”时计算=入学年-18；否则“不详”",
+        "年龄估算：若识别到“本科入学年份”，计算=入学年-18；否则“不详”",
         "当前所在城市或地区",
         "≤120字，归纳匹配亮点",
         "2–4点主要不匹配/风险",
-        "若干关键词，以逗号或顿号分隔（如：ADC, 抗体工程, 临床前, CMC）",
+        "若干关键词，以逗号/顿号分隔（如：ADC, 抗体工程, 临床前, CMC）",
         "长摘要；覆盖现任职责、过往亮点、教育与资质（中文）",
     ]
     for k,v in zip(EXCEL_COLUMNS, instructions):
@@ -386,8 +411,7 @@ def process():
     if not MODEL_API_KEY:
         return "缺少环境变量 MODEL_API_KEY / MODEL_BASE_URL", 400
 
-    # 先声明 global，再使用
-    global MODEL_NAME
+    global MODEL_NAME  # 需在首次使用前声明
 
     files = request.files.getlist("files")
     role = request.form.get("role",""); min_years = request.form.get("min_years","")
@@ -399,14 +423,14 @@ def process():
     if model_name:
         MODEL_NAME = model_name
 
-
-
     try:
         workers = int(request.form.get("workers", MAX_WORKERS)); workers = max(1, min(8, workers))
     except Exception:
         workers = MAX_WORKERS
 
     raw_cands = parse_uploads(files)
+    if not raw_cands:
+        return "未解析到有效候选文本（请确认ZIP/PDF/HTML/CSV内容）", 400
 
     pre=[]
     for r in raw_cands:
@@ -421,10 +445,6 @@ def process():
             "age_estimate": age_est, "fp": minhash_fingerprint(text)
         })
 
-    if not pre:
-        return "未解析到有效候选文本（请确认ZIP/PDF/HTML/CSV内容）", 400
-
-    # 去重
     seen=set(); unique=[]
     for it in pre:
         key=(it["name"], it["fp"])
@@ -433,12 +453,59 @@ def process():
 
     job={"role":role,"min_years":min_years,"must":must,"nice":nice,"edu":edu,"location":location,"note":note}
 
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    results=[]
-    def work(item):
-        out = call_llm(item["text"], item["name"], job)
+    rid = uuid.uuid4().hex[:8]
+    q = Queue()
+    JOBS[rid] = {"q": q, "done": False, "title": role or "未命名岗位"}
+
+    def runner(items, workers):
+        try:
+            total = len(items)
+            q.put(f"🟢 任务已启动：共 {total} 份候选；并发={workers}")
+            results=[]
+
+            if workers <= 1:
+                # 顺序处理，最稳
+                for idx, it in enumerate(items, start=1):
+                    q.put(f"… [{idx}/{total}] 评估：{it['name']}")
+                    out = call_llm(it["text"], it["name"], job)
+                    row = pack_row(out, it)
+                    results.append(row)
+                    q.put(f"✅ {row['name']} → {row['tier']} / {row['overall_score']}：{row['fit_summary'][:80]}")
+            else:
+                from concurrent.futures import ThreadPoolExecutor, as_completed
+                q.put("🧵 已启动并发线程…")
+                with ThreadPoolExecutor(max_workers=workers) as ex:
+                    futs = [ex.submit(lambda x: pack_row(call_llm(x['text'], x['name'], job), x), it) for it in items]
+                    done = 0
+                    for fu in as_completed(futs):
+                        row = fu.result(); results.append(row); done += 1
+                        q.put(f"✅ [{done}/{total}] {row['name']} → {row['tier']} / {row['overall_score']}：{row['fit_summary'][:80]}")
+
+            def sort_key(x):
+                tier_rank={"A+":0,"A":1,"B":2,"C":3}.get(x.get("tier","C"),3)
+                return (tier_rank, -(int(x.get("overall_score") or 0)))
+
+            results_sorted = sorted(results, key=sort_key)
+            shortlist=[r for r in results_sorted if r.get("tier") in ("A+","A")]
+            notfit=[r for r in results_sorted if r.get("tier") in ("B","C")]
+
+            excel = to_excel(results_sorted)
+            REPORTS[rid] = {
+                "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "counts": {"total": len(results_sorted), "aa": len(shortlist), "bc": len(notfit)},
+                "shortlist": shortlist, "notfit": notfit, "excel": excel
+            }
+            q.put("🟩 汇总完成：共 {} 人；A+/A：{}；B/C：{}".format(len(results_sorted), len(shortlist), len(notfit)))
+            q.put(f"🔗 下载：/download/{rid}    查看：/report/{rid}")
+        except Exception as e:
+            q.put(f"🟥 任务失败：{e}")
+        finally:
+            JOBS[rid]["done"] = True
+            q.put("[DONE]")
+
+    def pack_row(out, it):
         return {
-            "name": out.get("name") or item["name"],
+            "name": out.get("name") or it["name"],
             "overall_score": out.get("overall_score", 0),
             "tier": str(out.get("tier","")).upper(),
             "fit_summary": out.get("fit_summary",""),
@@ -448,31 +515,37 @@ def process():
             "current_title": out.get("current_title",""),
             "location": out.get("location",""),
             "remarks": out.get("remarks",""),
-            "email": item.get("email",""), "work_phone": item.get("work_phone",""), "mobile": item.get("mobile",""),
-            "age_estimate": item.get("age_estimate","不详")
+            "email": it.get("email",""), "work_phone": it.get("work_phone",""), "mobile": it.get("mobile",""),
+            "age_estimate": it.get("age_estimate","不详")
         }
 
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futs=[ex.submit(work, it) for it in unique]
-        for fu in as_completed(futs):
-            results.append(fu.result())
+    import threading
+    threading.Thread(target=runner, args=(unique, workers), daemon=True).start()
+    return render_template_string(STREAM_HTML, rid=rid)
 
-    shortlist=[r for r in results if r.get("tier") in ("A+","A")]
-    notfit=[r for r in results if r.get("tier") in ("B","C")]
+@app.route("/events/<rid>")
+def events(rid):
+    job = JOBS.get(rid)
+    if not job:
+        return "任务不存在", 404
+    q: Queue = job["q"]
 
-    def sort_key(x):
-        tier_rank={"A+":0,"A":1,"B":2,"C":3}.get(x.get("tier","C"),3)
-        return (tier_rank, -(int(x.get("overall_score") or 0)))
-    results_sorted = sorted(results, key=sort_key)
-
-    rid = uuid.uuid4().hex[:8]
-    excel = to_excel(results_sorted)
-    REPORTS[rid] = {
-        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "counts": {"total": len(results_sorted), "aa": len(shortlist), "bc": len(notfit)},
-        "shortlist": shortlist, "notfit": notfit, "excel": excel
+    def gen():
+        yield "data: ▶️ 连接已建立\\n\\n"
+        while True:
+            msg = q.get()
+            if msg == "[DONE]":
+                yield "data: 🏁 任务结束\\n\\n"
+                break
+            safe = str(msg).replace("\\r"," ").replace("\\n","\\n")
+            yield f"data: {safe}\\n\\n"
+    headers = {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",
+        "Connection": "keep-alive"
     }
-    return redirect(url_for("view_report", rid=rid))
+    return Response(gen(), headers=headers)
 
 @app.route("/report/<rid>")
 def view_report(rid):
@@ -487,6 +560,10 @@ def download_report(rid):
     bio = r["excel"]; bio.seek(0)
     return send_file(bio, as_attachment=True, download_name=f"sourcing_report_{rid}.xlsx",
                      mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+@app.route("/", methods=["HEAD"])
+def health():
+    return "", 200
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
