@@ -1,11 +1,11 @@
 import os, io, re, json, uuid, zipfile, time, hashlib, logging, csv, threading
 from datetime import datetime
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from queue import Queue, Empty
 from flask import Flask, request, render_template_string, send_file, url_for, Response, redirect
 import requests
 
-# ------- Optional parsers -------
+# ------------------- 可选解析器 -------------------
 try:
     from pdfminer.high_level import extract_text as pdf_extract_text
 except Exception:
@@ -21,18 +21,21 @@ try:
 except Exception:
     BeautifulSoup = None
 
-# ------- Config -------
+# ------------------- 基础配置 -------------------
 MODEL_API_KEY  = os.getenv("MODEL_API_KEY", "")
-MODEL_BASE_URL = os.getenv("MODEL_BASE_URL", "https://api.openai.com")  # DeepSeek 兼容 OpenAI 时可填其 Base URL
+MODEL_BASE_URL = os.getenv("MODEL_BASE_URL", "https://api.openai.com")
 MODEL_NAME     = os.getenv("MODEL_NAME", "deepseek-chat")
+
+# 并发/超时
 MAX_WORKERS    = int(os.getenv("MAX_WORKERS", "2"))
 MAX_CHARS_EACH = int(os.getenv("MAX_CHARS_EACH", "12000"))
 TIMEOUT_SEC    = int(os.getenv("TIMEOUT_SEC", "90"))
 RETRIES        = int(os.getenv("RETRIES", "2"))
 
+# 允许的上传类型
 ALLOWED_EXT = {".pdf", ".docx", ".txt", ".csv", ".zip", ".html", ".htm"}
 
-# 路径：报告落盘 & 任务状态落盘（断点续跑）
+# 存储目录：报告 & 任务（断点续跑）
 REPORT_DIR = os.path.join("static", "reports")
 JOB_DIR    = os.path.join("data", "jobs")
 os.makedirs(REPORT_DIR, exist_ok=True)
@@ -42,11 +45,11 @@ app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 300 * 1024 * 1024  # 300MB
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-# 内存快速索引（同时持久化到磁盘）
-REPORTS: Dict[str, Dict[str, Any]] = {}     # rid -> {counts, shortlist, notfit, excel_path}
+# 内存态（同时会持久化到磁盘）
+REPORTS: Dict[str, Dict[str, Any]] = {}     # rid -> {counts, shortlist, notfit, excel_path, created_at}
 JOBS: Dict[str, Dict[str, Any]] = {}        # rid -> {"q": Queue, "done": bool, "title": str}
 
-# ------- HTML Templates -------
+# ------------------- 页面模板 -------------------
 INDEX_HTML = """<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>Alsos Talent · 合规AI自动化寻访（MVP）</title>
 <style>
@@ -152,7 +155,6 @@ STREAM_HTML = """<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8"/>
     function append(t){ log.textContent += '\\n' + t; log.scrollTop = log.scrollHeight; }
     const es = new EventSource('/events/{{rid}}');
     es.onmessage = (e)=>{
-      // 完成时会发 LINKS|/download/<rid>|/report/<rid>
       const d = e.data || '';
       if (d.startsWith('LINKS|')) {
         const parts = d.split('|');
@@ -205,7 +207,7 @@ RESULTS_HTML = """<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8"/><m
   <div class="muted">© Alsos Talent · 合规AI寻访MVP</div>
 </div></body></html>"""
 
-# ------- Helpers -------
+# ------------------- 小工具 -------------------
 def ext_of(name:str)->str:
     name = name.lower()
     for x in ALLOWED_EXT:
@@ -248,21 +250,10 @@ def guess_name(text:str)->str:
     return head[:80]
 
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
-CN_MOBILE_RE = re.compile(r"(?<!\d)(1[3-9]\d{9})(?!\d)")
-GEN_PHONE_RE = re.compile(r"(?<!\d)(\+?\d[\d\s\-()]{6,}\d)(?!\d)")
 
-def extract_contacts(text:str)->Dict[str, Optional[str]]:
-    emails = EMAIL_RE.findall(text) or []
-    mobiles = CN_MOBILE_RE.findall(text) or []
-    phones  = [p.strip() for p in GEN_PHONE_RE.findall(text) if len(p.strip())<=20]
-    work_phone = None
-    mobile = mobiles[0] if mobiles else None
-    for p in phones:
-        pp = re.sub(r"\D","",p)
-        if mobile and mobile in p: continue
-        if len(pp) >= 7:
-            work_phone = p; break
-    return {"email": (emails[0] if emails else None), "work_phone": work_phone, "mobile": mobile}
+def extract_email(text:str)->str:
+    m = EMAIL_RE.findall(text) or []
+    return m[0] if m else ""
 
 YEAR_RE = re.compile(r"(19\d{2}|20\d{2})")
 BACHELOR_HINTS = re.compile(r"(本科|学士|Bachelor|B\.Sc|BSc|BS|BA)", re.I)
@@ -281,7 +272,35 @@ def minhash_fingerprint(text:str)->str:
 
 def truncate(s:str, n:int)->str: return s if len(s)<=n else s[:n]
 
-# ------- Job state persistence (断点续跑) -------
+def normalize_tier(raw: Any) -> str:
+    """
+    规范化成 'A+' / 'A' / 'B' / 'C'
+    兼容: 'A＋' (全角 +), 'A plus', 'A-plus', 'A +', 'APlus' 等。
+    其它非法值统一降级为 'C'，以免数据脏。
+    """
+    if raw is None:
+        return "C"
+    s = str(raw).strip().upper()
+    s = s.replace("＋", "+").replace("PLUS", "+").replace(" ", "")
+    s = s.replace("A-PLUS", "A+").replace("A+", "A+")
+    if s in ("A+", "A", "B", "C"):
+        return s
+    # 常见花样
+    if s in ("A+.", "A+/A", "A+/A+", "A++"): return "A+"
+    if s.startswith("A+"): return "A+"
+    if s.startswith("A"):  return "A"
+    if s.startswith("B"):  return "B"
+    if s.startswith("C"):  return "C"
+    return "C"
+
+def normalize_score(v: Any) -> int:
+    try:
+        x = int(float(str(v).strip()))
+        return max(0, min(100, x))
+    except Exception:
+        return 0
+
+# ------------------- 任务持久化（断点续跑） -------------------
 def job_json_path(rid:str)->str:
     return os.path.join(JOB_DIR, f"{rid}.json")
 
@@ -300,10 +319,22 @@ def load_job_state(rid:str)->Optional[Dict[str,Any]]:
     except Exception:
         return None
 
-# ------- LLM call -------
+# ------------------- LLM 调用 -------------------
 def call_llm(cand_text:str, cand_name:str, job:Dict[str,str])->Dict[str,Any]:
     system = ("You are an expert headhunter assistant. ALWAYS return strict JSON (no markdown). "
               "Scoring: 0-100; Tier: A+,A,B,C (A+/A=strong match). Answer in Chinese.")
+    schema_hint = {
+      "name":"string",
+      "overall_score":"int(0-100)",
+      "tier":"one of [A+,A,B,C]",
+      "fit_summary":"string (<=120 chars)",
+      "risks":["2-4条"],
+      "labels":["关键词"],
+      "current_company":"string?",
+      "current_title":"string?",
+      "location":"string?",
+      "remarks":"string (简历概述: 教育经历+工作履历，格式：年份-年份 学校/公司 职位/专业 一句话职责/成果)"
+    }
     user = {
         "role": job.get("role",""),
         "must_have": job.get("must",""),
@@ -314,11 +345,6 @@ def call_llm(cand_text:str, cand_name:str, job:Dict[str,str])->Dict[str,Any]:
         "note": job.get("note",""),
         "candidate_name": cand_name,
         "candidate_resume": truncate(cand_text, MAX_CHARS_EACH)
-    }
-    schema_hint = {
-      "name":"string","overall_score":"int(0-100)","tier":"one of [A+,A,B,C]",
-      "fit_summary":"string (<=120 chars)","risks":["2-4条"],"labels":["关键词"],
-      "current_company":"string?","current_title":"string?","location":"string?","remarks":"string"
     }
     prompt = f"""岗位要求与候选文本如下。请输出严格JSON，字段为：
 {json.dumps(schema_hint, ensure_ascii=False, indent=2)}
@@ -338,16 +364,19 @@ def call_llm(cand_text:str, cand_name:str, job:Dict[str,str])->Dict[str,Any]:
             r = requests.post(url, headers=headers, json=payload, timeout=TIMEOUT_SEC); r.raise_for_status()
             content = r.json()["choices"][0]["message"]["content"]
             m = re.search(r"\{.*\}", content, flags=re.S); content = m.group(0) if m else content
-            out = json.loads(content); 
+            out = json.loads(content)
             if not out.get("name") and cand_name: out["name"]=cand_name
+            # 重要：统一分数 & 等级，确保 A+ 不丢
+            out["overall_score"] = normalize_score(out.get("overall_score"))
+            out["tier"] = normalize_tier(out.get("tier"))
             return out
         except Exception as e:
-            err=e; time.sleep(1.5*(attempt+1))
+            err=e; time.sleep(1.2*(attempt+1))
     return {"name": cand_name or "(未识别)", "overall_score":0, "tier":"C",
             "fit_summary": f"解析失败：{err}", "risks":["LLM调用失败/JSON解析失败"], "labels":[],
             "current_company":"", "current_title":"", "location":"", "remarks": ""}
 
-# ------- Parsing uploads -------
+# ------------------- 解析上传 -------------------
 def parse_single_file(name:str, b:bytes)->List[Dict[str,str]]:
     ext = ext_of(name); out=[]
     if ext == ".pdf":
@@ -397,10 +426,11 @@ def parse_uploads(wfs)->List[Dict[str,str]]:
             cands.extend(parse_single_file(f.filename, b))
     return cands
 
-# ------- Excel output (openpyxl) -------
+# ------------------- Excel 导出 -------------------
 EXCEL_COLUMNS = [
-    "候选人名字","目前所在公司","目前职位","匹配等级（A+/A/B/C）",
-    "工作电话","手机","E-mail","年龄预估","目前所在地",
+    "候选人名字","目前所在公司","目前职位",
+    "评分（0-100）","匹配等级（A+/A/B/C）",
+    "E-mail","年龄预估","目前所在地",
     "契合摘要","风险点","标签","Remarks"
 ]
 
@@ -417,9 +447,8 @@ def to_excel(rows:List[Dict[str,Any]])->io.BytesIO:
             r.get("name",""),
             r.get("current_company",""),
             r.get("current_title",""),
-            r.get("tier",""),
-            r.get("work_phone",""),
-            r.get("mobile",""),
+            normalize_score(r.get("overall_score")),
+            normalize_tier(r.get("tier")),
             r.get("email",""),
             r.get("age_estimate","不详"),
             r.get("location",""),
@@ -429,10 +458,11 @@ def to_excel(rows:List[Dict[str,Any]])->io.BytesIO:
             r.get("remarks",""),
         ])
 
+    # D=评分 E=等级
     dv = DataValidation(type="list", formula1='"A+,A,B,C"', allow_blank=True,
                         showErrorMessage=True, errorTitle="输入限制", error="请选择 A+ / A / B / C")
     ws.add_data_validation(dv)
-    dv.add(f"D2:D5000")
+    dv.add(f"E2:E5000")
 
     ws2 = wb.create_sheet("填写说明")
     ws2.append(["字段","说明"])
@@ -440,50 +470,40 @@ def to_excel(rows:List[Dict[str,Any]])->io.BytesIO:
         "候选人姓名（中文或英文）",
         "当前就职公司（可从简历/导出文件提取）",
         "当前职位/头衔",
-        "从列表选择：A+ / A / B / C",
-        "办公电话（无则留空）",
-        "手机（无则留空）",
+        "0-100的综合评分（分数越高越匹配）",
+        "从列表选择：A+ / A / B / C（A+ 表示极度匹配）",
         "邮箱（无则留空）",
         "年龄估算：若识别到“本科入学年份”，计算=入学年-18；否则“不详”",
         "当前所在城市或地区",
         "≤120字，归纳匹配亮点",
         "2–4点主要不匹配/风险",
         "若干关键词，以逗号/顿号分隔",
-        "长摘要；覆盖现任职责、过往亮点、教育与资质（中文）",
+        "长摘要；覆盖教育+工作履历（按年份-年份 学校/公司 职位/专业 一句话职责/成果）",
     ]
     for k,v in zip(EXCEL_COLUMNS, instructions):
         ws2.append([k,v])
 
     bio = io.BytesIO(); wb.save(bio); bio.seek(0); return bio
 
-# ------- Pack row helper -------
+# ------------------- 合成每行 -------------------
 def pack_row(out, it):
     return {
         "name": out.get("name") or it["name"],
-        "overall_score": out.get("overall_score", 0),
-        "tier": str(out.get("tier","")).upper(),
+        "overall_score": normalize_score(out.get("overall_score")),
+        "tier": normalize_tier(out.get("tier")),
         "fit_summary": out.get("fit_summary",""),
         "risks": out.get("risks",[]) or [],
         "labels": out.get("labels",[]) or [],
         "current_company": out.get("current_company",""),
         "current_title": out.get("current_title",""),
         "location": out.get("location",""),
+        "email": it.get("email",""),
+        "age_estimate": it.get("age_estimate","不详"),
         "remarks": out.get("remarks",""),
-        "email": it.get("email",""), "work_phone": it.get("work_phone",""), "mobile": it.get("mobile",""),
-        "age_estimate": it.get("age_estimate","不详")
     }
 
-# ------- Core runner with resume -------
+# ------------------- 核心任务（含断点续跑） -------------------
 def start_or_resume_job(rid:str, state:Dict[str,Any], workers:int, q:Queue):
-    """
-    state 结构：
-    {
-      "created_at": "...",
-      "job": {...岗位参数...},
-      "items": [ {name,text,src,email,work_phone,mobile,age_estimate,fp, status:"todo|done", row?:{...}} ... ],
-      "finished": false
-    }
-    """
     def runner():
         try:
             items = state["items"]
@@ -532,7 +552,13 @@ def start_or_resume_job(rid:str, state:Dict[str,Any], workers:int, q:Queue):
 
             # 导出 Excel 并落盘
             excel_io = to_excel(results_sorted)
-            excel_path = os.path.join(REPORT_DIR, f"sourcing_report_{rid}.xlsx")
+            # 用职位名称命名（若有）
+            role = state["job"].get("role","").strip()
+            file_stub = rid
+            if role:
+                safe_role = re.sub(r'[\\/:*?"<>|]+', "_", role)
+                file_stub = f"{safe_role}"
+            excel_path = os.path.join(REPORT_DIR, f"{file_stub}.xlsx")
             with open(excel_path, "wb") as f:
                 f.write(excel_io.getbuffer())
 
@@ -548,7 +574,6 @@ def start_or_resume_job(rid:str, state:Dict[str,Any], workers:int, q:Queue):
 
             q.put("🟩 汇总完成：共 {} 人；A+/A：{}；B/C：{}".format(len(results_sorted), len(shortlist), len(notfit)))
             q.put(f"🔗 下载：/download/{rid}    查看：/report/{rid}")
-            # 给前端链接，让按钮可用
             q.put(f"LINKS|/download/{rid}|/report/{rid}")
         except Exception as e:
             q.put(f"🟥 任务失败：{e}")
@@ -558,15 +583,12 @@ def start_or_resume_job(rid:str, state:Dict[str,Any], workers:int, q:Queue):
 
     threading.Thread(target=runner, daemon=True).start()
 
-# ------- Routes -------
+# ------------------- 路由 -------------------
 @app.route("/", methods=["GET"])
 def index():
-    # 汇总历史（从磁盘加载简单信息）
     items=[]
-    # 先用内存里已有的
     for rid, v in REPORTS.items():
         items.append({"id": rid, "created_at": v.get("created_at"), "counts": v.get("counts",{}), "excel_path": v.get("excel_path")})
-    # 也把磁盘上未加载的补齐
     for fn in os.listdir(JOB_DIR):
         if not fn.endswith(".json"): continue
         rid = fn[:-5]
@@ -575,8 +597,9 @@ def index():
         if not state: continue
         counts = {"total": len(state.get("items",[])), "aa": 0, "bc": 0}
         unfinished = not state.get("finished", False)
-        items.append({"id": rid, "created_at": state.get("created_at"), "counts": counts, "unfinished": unfinished})
-    # 排序
+        row = {"id": rid, "created_at": state.get("created_at"), "counts": counts}
+        if unfinished: row["unfinished"]=True
+        if not found: items.append(row)
     items.sort(key=lambda x: x.get("created_at",""), reverse=True)
     return render_template_string(INDEX_HTML, reports=items, model_name=MODEL_NAME, max_workers=MAX_WORKERS)
 
@@ -587,12 +610,15 @@ def process():
 
     global MODEL_NAME
     files = request.files.getlist("files")
-    role = request.form.get("role",""); min_years = request.form.get("min_years","")
-    must = request.form.get("must",""); nice = request.form.get("nice","")
-    edu = request.form.get("edu",""); location = request.form.get("location","")
+    role = request.form.get("role","").strip()
+    min_years = request.form.get("min_years","").strip()
+    must = request.form.get("must","").strip()
+    nice = request.form.get("nice","").strip()
+    edu = request.form.get("edu","").strip()
+    location = request.form.get("location","").strip()
     note = request.form.get("note","")
-    model_name = request.form.get("model_name", MODEL_NAME)
-    if model_name: MODEL_NAME = model_name
+    model_name = request.form.get("model_name", MODEL_NAME).strip() or MODEL_NAME
+    MODEL_NAME = model_name
     try:
         workers = int(request.form.get("workers", MAX_WORKERS)); workers = max(1, min(8, workers))
     except Exception:
@@ -607,12 +633,12 @@ def process():
         text = (r.get("text") or "").strip()
         if not text: continue
         nm = r.get("name") or guess_name(text)
-        contacts = extract_contacts(text)
+        email = extract_email(text)
         age_est = estimate_birth_year_str(text)
         pre.append({
             "name": nm, "text": text, "src": r.get("src"),
-            "email": contacts.get("email") or "", "work_phone": contacts.get("work_phone") or "", "mobile": contacts.get("mobile") or "",
-            "age_estimate": age_est, "fp": minhash_fingerprint(text), "status": "todo"
+            "email": email, "age_estimate": age_est,
+            "fp": minhash_fingerprint(text), "status": "todo"
         })
 
     # 去重
@@ -622,11 +648,17 @@ def process():
         if key in seen: continue
         seen.add(key); unique.append(it)
 
-    rid = uuid.uuid4().hex[:8]
+    # 任务ID命名：优先用职位；否则随机
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    if role:
+        safe_role = re.sub(r'[\\/:*?"<>|]+', "_", role)
+        rid = f"{safe_role}_{ts}"
+    else:
+        rid = uuid.uuid4().hex[:8]
+
     created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     job = {"role":role,"min_years":min_years,"must":must,"nice":nice,"edu":edu,"location":location,"note":note}
 
-    # 初始化任务状态到磁盘
     state = {"created_at": created_at, "job": job, "items": unique, "finished": False}
     save_job_state(rid, state)
 
@@ -640,12 +672,10 @@ def resume(rid):
     state = load_job_state(rid)
     if not state:
         return "任务不存在或无法恢复", 404
-    # 若已经在跑就不重复起
     if rid in JOBS and not JOBS[rid]["done"]:
         return redirect(url_for("view_report", rid=rid))
     q = Queue()
     JOBS[rid] = {"q": q, "done": False, "title": state["job"].get("role","未命名岗位")}
-    # 缺省并发：MAX_WORKERS
     start_or_resume_job(rid, state, MAX_WORKERS, q)
     return render_template_string(STREAM_HTML, rid=rid)
 
@@ -657,18 +687,17 @@ def events(rid):
     q: Queue = job["q"]
 
     def gen():
-        yield "data: ▶️ 连接已建立\n\n"
+        yield "data: ▶️ 连接已建立\\n\\n"
         while True:
             try:
-                msg = q.get(timeout=12)  # 心跳 12s
+                msg = q.get(timeout=12)
                 if msg == "[DONE]":
-                    yield "data: 🏁 任务结束\n\n"
+                    yield "data: 🏁 任务结束\\n\\n"
                     break
-                safe = str(msg).replace("\r"," ").replace("\n","\\n")
-                yield f"data: {safe}\n\n"
+                safe = str(msg).replace("\\r"," ").replace("\\n","\\\\n")
+                yield f"data: {safe}\\n\\n"
             except Empty:
-                # 心跳注释行，防止代理闲置断开
-                yield f": ping {int(time.time())}\n\n"
+                yield f": ping {int(time.time())}\\n\\n"
 
     headers = {
         "Content-Type": "text/event-stream",
@@ -682,11 +711,9 @@ def events(rid):
 def view_report(rid):
     r = REPORTS.get(rid)
     if not r:
-        # 尝试从磁盘恢复
         state = load_job_state(rid)
         if not state or not state.get("finished"):
             return "报告尚未生成或任务未完成", 404
-        # 仅给出粗略 counts
         counts = {"total": len(state["items"]), "aa": 0, "bc": 0}
         return render_template_string(RESULTS_HTML, rid=rid, counts=counts, shortlist=[], notfit=[])
     return render_template_string(RESULTS_HTML, rid=rid, counts=r["counts"], shortlist=r["shortlist"], notfit=r["notfit"])
@@ -697,12 +724,16 @@ def download_report(rid):
     path = None
     if r and r.get("excel_path"): path = r["excel_path"]
     else:
-        # 尝试磁盘
-        candidate = os.path.join(REPORT_DIR, f"sourcing_report_{rid}.xlsx")
-        if os.path.exists(candidate): path = candidate
+        # 兼容：用职位名命名 or rid 命名 两种路径都试试
+        # 1) rid.xlsx
+        candidate1 = os.path.join(REPORT_DIR, f"{rid}.xlsx")
+        # 2) 如果 rid 带职位+时间，这里直接用它
+        candidate2 = candidate1
+        if os.path.exists(candidate1): path = candidate1
+        if not path and os.path.exists(candidate2): path = candidate2
     if not path or not os.path.exists(path):
         return "报告文件不存在", 404
-    return send_file(path, as_attachment=True, download_name=f"sourcing_report_{rid}.xlsx",
+    return send_file(path, as_attachment=True, download_name=os.path.basename(path),
                      mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 @app.route("/", methods=["HEAD"])
