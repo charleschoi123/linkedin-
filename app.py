@@ -38,6 +38,8 @@ DATA_DIR = os.path.abspath("./data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
 app = Flask(__name__)
+
+# rid -> 运行态
 RUNS: Dict[str, Dict[str, Any]] = {}
 
 # ---------- HTML ----------
@@ -73,10 +75,11 @@ ul.files li button{background:#334155;color:#cbd5e1;border:0;border-radius:8px;p
 <body>
 <div class="wrap">
   <h1>linkedin-批量简历分析</h1>
-  <div class="card"><p class="note">说明：上传你合规导出的 ZIP/PDF/HTML/TXT，后端并发解析与AI打分，实时输出并最终产出Excel/榜单。</p></div>
+  <div class="card"><p class="note">说明：上传你合规导出的 ZIP/PDF/HTML/TXT/DOCX，后端并发解析与AI打分，实时输出并最终产出Excel/榜单。</p></div>
 
   <form id="f" action="/process" method="post" enctype="multipart/form-data">
     <div class="card">
+      <h3 style="margin:0 0 8px">岗位/筛选要求</h3>
       <div class="row">
         <div>
           <label>职位名称（必填）</label>
@@ -85,6 +88,26 @@ ul.files li button{background:#334155;color:#cbd5e1;border:0;border-radius:8px;p
         <div>
           <label>方向（选填）</label>
           <input name="track" placeholder="如：Infra / SRE / 医疗IT">
+        </div>
+      </div>
+      <div class="row">
+        <div>
+          <label>最低年限</label>
+          <input name="min_years" placeholder="如：8 或 10-15">
+        </div>
+        <div>
+          <label>年龄要求</label>
+          <input name="age_req" placeholder="如：30-40；或不超过38；留空为不限">
+        </div>
+      </div>
+      <div class="row">
+        <div>
+          <label>Must-have关键词（逗号分隔）</label>
+          <input name="must" placeholder="如：K8s, DevOps, 安全合规">
+        </div>
+        <div>
+          <label>Nice-to-have关键词（逗号分隔）</label>
+          <input name="nice" placeholder="如：HPC, 监管合规, 金融行业">
         </div>
       </div>
       <label>补充说明（可粘贴JD要点）</label>
@@ -110,6 +133,7 @@ ul.files li button{background:#334155;color:#cbd5e1;border:0;border-radius:8px;p
 const file = document.getElementById('file');
 const flist = document.getElementById('flist');
 file.addEventListener('change', refreshList);
+
 function refreshList(){
   flist.innerHTML='';
   const dt = new DataTransfer();
@@ -246,36 +270,28 @@ def text_from_file(path:str) -> str:
         return ""
 
 EMAIL_RE = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.I)
+
 def extract_email(text:str) -> str:
     m = EMAIL_RE.search(text)
     return m.group(0) if m else ""
 
-def estimate_age_from_edu(education: Any) -> str:
-    """若模型不给 age_estimate，就用本科入学年 + 18 粗估；否则返回‘不详’。"""
-    try:
-        year = None
-        if isinstance(education, list):
-            for e in education:
-                deg = (e.get("degree","") or "").lower()
-                st  = str(e.get("start","") or "")
-                # 只要本科学历（含 bachelor/本科）
-                if ("bachelor" in deg) or ("本科" in deg):
-                    m = re.search(r"(19|20)\d{2}", st)
-                    if m: year = int(m.group(0)); break
-            if year:
-                now = datetime.now().year
-                return str(max(18, now - year + 18))
-    except Exception:
-        pass
-    return "不详"
-
 def llm_chat(messages: List[Dict[str,str]], temperature: float=0.2, max_tokens:int=1024) -> str:
+    """
+    统一的 LLM 调用（DeepSeek/OpenAI 兼容）：
+    base_url + /v1/chat/completions，避免 /v1/v1。
+    """
     if not MODEL_API_KEY or not MODEL_BASE_URL:
         return ""
+
     url = f"{MODEL_BASE_URL}/v1/chat/completions"
     headers = {"Authorization": f"Bearer {MODEL_API_KEY}", "Content-Type": "application/json"}
-    payload = {"model": MODEL_NAME, "messages": messages, "temperature": temperature,
-               "max_tokens": max_tokens, "stream": False}
+    payload = {
+        "model": MODEL_NAME,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "stream": False
+    }
     try:
         r = requests.post(url, headers=headers, json=payload, timeout=60)
         r.raise_for_status()
@@ -286,25 +302,26 @@ def llm_chat(messages: List[Dict[str,str]], temperature: float=0.2, max_tokens:i
         return ""
 
 PROMPT_SYS = (
-"你是资深猎头助理。"
-"请基于候选人简历文本，提取结构化字段并做岗位匹配。仅输出合法 JSON。"
-"字段："
-"name, current_company, current_title, email, location, "
-"age_estimate, tags(list), "
-"education(list: {school, major, degree, start, end}), "
-"experiences(list: {company, title, start, end, one_line}), "
-"fit_summary(中文一段，概括与岗位的契合要点), "
-"risks(中文一段，概括潜在风险/短板), "
-"remark(用时间线格式：例如“2012-2016年 就读于XX大学/计算机 本科；2016-2020年 就职于XX公司/高级工程师，主要负责XXX”。总长≤120字), "
-"score(0-100 数值), grade(A+/A/B/C)。"
-"评分口径：关键关键词匹配度 + 近3年经验相关性 + 平台/影响力。90+为A+，80-89为A，70-79为B，其它C。"
-"若简历无邮箱，从文本中尝试抽取；电话不要。"
+"你是资深猎头助理，负责把候选人简历文本结构化并做岗位匹配，输出严格 JSON。"
+"字段：name, current_company, current_title, email, location, age_estimate, "
+"education(list:{school,major,degree,start,end}), "
+"experiences(list:{company,title,start,end,one_line}), "
+"fit_summary(50字内), risks(50字内), "
+"remark(按时间线的中文概述：xxxx-xxxx 学校/专业/学历；xxxx-xxxx 公司/职位/一句话职责…，尽量补全), "
+"score(0-100), grade(A+/A/B/C)。"
+"打分口径：匹配 must-have 与方向；近3年经验与岗位相关度；平台/影响力；年限与年龄要求；nice-to-have 加分。"
+"年龄预估：若有本科起止时间，按18岁入学、22岁毕业推算当前年龄；没有教育时间则写“不详”。"
+"若简历未给出 email，从文本中抽取；不要电话。"
 )
 
-def build_messages(role:str, track:str, note:str, text:str)->List[Dict[str,str]]:
-    user = f"""岗位：{role}
-方向：{track}
-补充要求：{note}
+def build_messages(cfg: Dict[str,str], text:str)->List[Dict[str,str]]:
+    user = f"""岗位：{cfg.get('role')}
+方向：{cfg.get('track')}
+最低年限：{cfg.get('min_years')}
+年龄要求：{cfg.get('age_req')}
+Must-have：{cfg.get('must')}
+Nice-to-have：{cfg.get('nice')}
+补充说明：{cfg.get('note')}
 
 候选人简历文本：
 {text}
@@ -321,7 +338,7 @@ def grade_from_score(s: float) -> str:
     if s >= 70: return "B"
     return "C"
 
-# ---------- 主流程 ----------
+# ---------- 处理主逻辑 ----------
 def handle_zip_or_file(upload_path: str, work_dir:str) -> List[str]:
     files = []
     name = os.path.basename(upload_path)
@@ -340,10 +357,10 @@ def handle_zip_or_file(upload_path: str, work_dir:str) -> List[str]:
         files.append(upload_path)
     return files
 
-def process_resume(path:str, role:str, track:str, note:str)->Dict[str,Any]:
+def process_resume(path:str, cfg:Dict[str,str])->Dict[str,Any]:
     text = text_from_file(path)
     email = extract_email(text)
-    msg = build_messages(role,track,note,text[:12000])
+    msg = build_messages(cfg, text[:12000])
     content = llm_chat(msg, temperature=0.2, max_tokens=900)
     data = {}
     if content:
@@ -358,19 +375,12 @@ def process_resume(path:str, role:str, track:str, note:str)->Dict[str,Any]:
                 data = json.loads(re.sub(r"```json|```","",content2).strip())
             except Exception:
                 data = {}
-    # 兜底字段
+    # 兜底
     data["email"] = data.get("email") or email or ""
-    data["name"]  = (data.get("name") or "").strip()
+    data["name"]  = data.get("name") or ""
     data["current_company"] = data.get("current_company") or ""
     data["current_title"]   = data.get("current_title") or ""
     data["remark"] = data.get("remark") or ""
-    data["fit_summary"] = data.get("fit_summary") or ""
-    data["risks"] = data.get("risks") or ""
-
-    # 年龄估算兜底
-    if not data.get("age_estimate"):
-        data["age_estimate"] = estimate_age_from_edu(data.get("education"))
-
     # 分数与等级
     sc = data.get("score")
     try:
@@ -379,17 +389,11 @@ def process_resume(path:str, role:str, track:str, note:str)->Dict[str,Any]:
         sc = 0.0
     data["score"] = round(sc,1)
     data["grade"] = grade_from_score(sc)
-
-    # 若还是没有姓名 → 用“文件名去扩展名”（不含任何目录）
-    if not data["name"]:
-        data["name"] = os.path.splitext(os.path.basename(path))[0]
-
     data["_sig"] = (data["name"].strip().lower(), data["current_company"].strip().lower())
     return data
 
 def write_excel(rows: List[Dict[str,Any]], xlsx_path:str):
     import openpyxl
-    from openpyxl.styles import Alignment, Font
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Candidates"
@@ -415,6 +419,7 @@ def write_excel(rows: List[Dict[str,Any]], xlsx_path:str):
             ", ".join(r.get("tags",[]) or []),
             r.get("remark",""),
         ])
+    # 列宽
     for col in ws.columns:
         ws.column_dimensions[col[0].column_letter].width = 18
     ws.column_dimensions['I'].width = 28
@@ -429,14 +434,22 @@ def index():
 @app.route("/process", methods=["POST"])
 def process():
     role  = (request.form.get("role") or "").strip()
-    track = (request.form.get("track") or "").strip()
-    note  = (request.form.get("note") or "").strip()
     if not role:
         return ("职位名称必填", 400)
 
+    cfg = {
+        "role"     : role,
+        "track"    : (request.form.get("track") or "").strip(),
+        "min_years": (request.form.get("min_years") or "").strip(),
+        "age_req"  : (request.form.get("age_req") or "").strip(),
+        "must"     : (request.form.get("must") or "").strip(),
+        "nice"     : (request.form.get("nice") or "").strip(),
+        "note"     : (request.form.get("note") or "").strip(),
+    }
+
     rid = f"{slugify(role)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     run = ensure_run(rid)
-    run["role"], run["track"], run["name"] = role, track, rid
+    run["role"], run["track"], run["name"] = role, cfg["track"], rid
 
     work_dir = run["dir"]
     up_dir   = os.path.join(work_dir,"uploads")
@@ -467,8 +480,9 @@ def process():
 
             results = []
             seen = set()
+            from concurrent.futures import ThreadPoolExecutor, as_completed
             with ThreadPoolExecutor(max_workers=CONCURRENCY) as ex:
-                futs = [ex.submit(process_resume, p, role, track, note) for p in todo]
+                futs = [ex.submit(process_resume, p, cfg) for p in todo]
                 for i,f in enumerate(as_completed(futs), start=1):
                     try:
                         d = f.result()
@@ -502,6 +516,7 @@ def process():
 
     from threading import Thread
     Thread(target=runner, daemon=True).start()
+
     return redirect(url_for("events", rid=rid))
 
 @app.route("/events/<rid>")
@@ -513,14 +528,16 @@ def events(rid):
 def stream(rid):
     run = ensure_run(rid)
     q: Queue = run["q"]
+
     def gen():
-        yield "data: 连接已建立\n\n"
+        yield "data: 连接已建立\\n\\n"
         while True:
             try:
                 msg = q.get(timeout=15)
-                yield f"data: {msg}\n\n"
+                yield f"data: {msg}\\n\\n"
             except Empty:
-                yield "data: \n\n"
+                yield "data: \\n\\n"
+
     headers = {
         "Content-Type":"text/event-stream",
         "Cache-Control":"no-cache",
