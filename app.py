@@ -1,4 +1,4 @@
-import os, io, re, json, uuid, zipfile, time, hashlib, logging, csv, threading
+import os, io, re, json, uuid, zipfile, time, hashlib, logging, csv, threading, glob
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple
 from queue import Queue, Empty
@@ -273,11 +273,6 @@ def minhash_fingerprint(text:str)->str:
 def truncate(s:str, n:int)->str: return s if len(s)<=n else s[:n]
 
 def normalize_tier(raw: Any) -> str:
-    """
-    规范化成 'A+' / 'A' / 'B' / 'C'
-    兼容: 'A＋' (全角 +), 'A plus', 'A-plus', 'A +', 'APlus' 等。
-    其它非法值统一降级为 'C'，以免数据脏。
-    """
     if raw is None:
         return "C"
     s = str(raw).strip().upper()
@@ -285,7 +280,6 @@ def normalize_tier(raw: Any) -> str:
     s = s.replace("A-PLUS", "A+").replace("A+", "A+")
     if s in ("A+", "A", "B", "C"):
         return s
-    # 常见花样
     if s in ("A+.", "A+/A", "A+/A+", "A++"): return "A+"
     if s.startswith("A+"): return "A+"
     if s.startswith("A"):  return "A"
@@ -299,6 +293,13 @@ def normalize_score(v: Any) -> int:
         return max(0, min(100, x))
     except Exception:
         return 0
+
+# 将职位名安全化（空格等全部替换为下划线）
+def safe_role_name(role: str) -> str:
+    if not role: return ""
+    s = re.sub(r'[^0-9A-Za-z\u4e00-\u9fff_-]+', "_", role)
+    s = re.sub(r'_+', "_", s).strip("_")
+    return s or "role"
 
 # ------------------- 任务持久化（断点续跑） -------------------
 def job_json_path(rid:str)->str:
@@ -366,7 +367,6 @@ def call_llm(cand_text:str, cand_name:str, job:Dict[str,str])->Dict[str,Any]:
             m = re.search(r"\{.*\}", content, flags=re.S); content = m.group(0) if m else content
             out = json.loads(content)
             if not out.get("name") and cand_name: out["name"]=cand_name
-            # 重要：统一分数 & 等级，确保 A+ 不丢
             out["overall_score"] = normalize_score(out.get("overall_score"))
             out["tier"] = normalize_tier(out.get("tier"))
             return out
@@ -458,7 +458,6 @@ def to_excel(rows:List[Dict[str,Any]])->io.BytesIO:
             r.get("remarks",""),
         ])
 
-    # D=评分 E=等级
     dv = DataValidation(type="list", formula1='"A+,A,B,C"', allow_blank=True,
                         showErrorMessage=True, errorTitle="输入限制", error="请选择 A+ / A / B / C")
     ws.add_data_validation(dv)
@@ -516,7 +515,7 @@ def start_or_resume_job(rid:str, state:Dict[str,Any], workers:int, q:Queue):
                 row = pack_row(out, it)
                 it["row"] = row
                 it["status"] = "done"
-                save_job_state(rid, state)  # 边跑边落盘
+                save_job_state(rid, state)
                 return row
 
             results=[]
@@ -542,7 +541,6 @@ def start_or_resume_job(rid:str, state:Dict[str,Any], workers:int, q:Queue):
                         row = fu.result(); results.append(row); done += 1
                         q.put(f"✅ [{done}/{total}] {row['name']} → {row['tier']} / {row['overall_score']}：{row['fit_summary'][:80]}")
 
-            # 排序与分组
             def sort_key(x):
                 tier_rank={"A+":0,"A":1,"B":2,"C":3}.get(x.get("tier","C"),3)
                 return (tier_rank, -(int(x.get("overall_score") or 0)))
@@ -550,14 +548,12 @@ def start_or_resume_job(rid:str, state:Dict[str,Any], workers:int, q:Queue):
             shortlist=[r for r in results_sorted if r.get("tier") in ("A+","A")]
             notfit=[r for r in results_sorted if r.get("tier") in ("B","C")]
 
-            # 导出 Excel 并落盘
             excel_io = to_excel(results_sorted)
-            # 用职位名称命名（若有）
+
+            # 用“职位名（已安全化）”命名，避免空格 404
             role = state["job"].get("role","").strip()
-            file_stub = rid
-            if role:
-                safe_role = re.sub(r'[\\/:*?"<>|]+', "_", role)
-                file_stub = f"{safe_role}"
+            safe_role = safe_role_name(role)
+            file_stub = safe_role if safe_role else rid
             excel_path = os.path.join(REPORT_DIR, f"{file_stub}.xlsx")
             with open(excel_path, "wb") as f:
                 f.write(excel_io.getbuffer())
@@ -568,7 +564,6 @@ def start_or_resume_job(rid:str, state:Dict[str,Any], workers:int, q:Queue):
                 "shortlist": shortlist, "notfit": notfit, "excel_path": excel_path
             }
 
-            # 更新任务状态持久化
             state["finished"] = True
             save_job_state(rid, state)
 
@@ -648,13 +643,10 @@ def process():
         if key in seen: continue
         seen.add(key); unique.append(it)
 
-    # 任务ID命名：优先用职位；否则随机
+    # 任务ID：职位名(安全化)+时间；如果没职位名，用随机ID
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    if role:
-        safe_role = re.sub(r'[\\/:*?"<>|]+', "_", role)
-        rid = f"{safe_role}_{ts}"
-    else:
-        rid = uuid.uuid4().hex[:8]
+    sr = safe_role_name(role)
+    rid = f"{sr}_{ts}" if sr else uuid.uuid4().hex[:8]
 
     created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     job = {"role":role,"min_years":min_years,"must":must,"nice":nice,"edu":edu,"location":location,"note":note}
@@ -720,19 +712,33 @@ def view_report(rid):
 
 @app.route("/download/<rid>")
 def download_report(rid):
+    # 优先使用内存路径
     r = REPORTS.get(rid)
-    path = None
-    if r and r.get("excel_path"): path = r["excel_path"]
-    else:
-        # 兼容：用职位名命名 or rid 命名 两种路径都试试
-        # 1) rid.xlsx
-        candidate1 = os.path.join(REPORT_DIR, f"{rid}.xlsx")
-        # 2) 如果 rid 带职位+时间，这里直接用它
-        candidate2 = candidate1
-        if os.path.exists(candidate1): path = candidate1
-        if not path and os.path.exists(candidate2): path = candidate2
+    path = r.get("excel_path") if r else None
+
+    # 兜底：从 rid 中解析职位前缀，尝试匹配文件
+    if not path or not os.path.exists(path):
+        # rid 可能是：Senior_Infrastructure_Architect_20250902_023046
+        base = rid
+        m = re.match(r"(.+?)_(\d{8}_\d{6})$", rid)
+        if m:
+            base = m.group(1)
+        # base 进一步安全化（处理用户手动拼出来的rid）
+        base_s = safe_role_name(base)
+        # 尝试几种候选路径
+        candidates = [
+            os.path.join(REPORT_DIR, f"{base}.xlsx"),
+            os.path.join(REPORT_DIR, f"{base_s}.xlsx"),
+            *glob.glob(os.path.join(REPORT_DIR, f"{base}*.xlsx")),
+            *glob.glob(os.path.join(REPORT_DIR, f"{base_s}*.xlsx")),
+        ]
+        for c in candidates:
+            if os.path.exists(c):
+                path = c; break
+
     if not path or not os.path.exists(path):
         return "报告文件不存在", 404
+
     return send_file(path, as_attachment=True, download_name=os.path.basename(path),
                      mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
