@@ -1,7 +1,7 @@
 import os, io, re, json, uuid, zipfile, time, hashlib, logging, csv
 from datetime import datetime
 from typing import List, Dict, Any, Optional
-from queue import Queue
+from queue import Queue, Empty
 from flask import Flask, request, render_template_string, send_file, redirect, url_for, Response
 import requests
 
@@ -531,14 +531,19 @@ def events(rid):
     q: Queue = job["q"]
 
     def gen():
-        yield "data: ▶️ 连接已建立\\n\\n"
+        yield "data: ▶️ 连接已建立\n\n"
         while True:
-            msg = q.get()
-            if msg == "[DONE]":
-                yield "data: 🏁 任务结束\\n\\n"
-                break
-            safe = str(msg).replace("\\r"," ").replace("\\n","\\n")
-            yield f"data: {safe}\\n\\n"
+            try:
+                msg = q.get(timeout=12)   # 每 12 秒检测一次
+                if msg == "[DONE]":
+                    yield "data: 🏁 任务结束\n\n"
+                    break
+                safe = str(msg).replace("\r", " ").replace("\n", "\\n")
+                yield f"data: {safe}\n\n"
+            except Empty:
+                # 发一个心跳，保持 SSE 通道活跃
+                yield f": ping {int(time.time())}\n\n"
+
     headers = {
         "Content-Type": "text/event-stream",
         "Cache-Control": "no-cache",
