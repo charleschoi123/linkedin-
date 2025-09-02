@@ -61,57 +61,90 @@ ALLOWED_EXTS = (".pdf", ".docx", ".doc", ".html", ".htm", ".txt")
 
 # ----------------- HTML 模板 -----------------
 
-INDEX_HTML = """<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>Alsos Talent · 合规AI自动化寻访（MVP）</title>
-<style>
- body { font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial;margin:0;background:#0b0f14;color:#e3e8f2;}
- .wrap { max-width: 980px; margin: 32px auto; padding: 0 16px; }
- h1 { font-size: 22px; margin: 12px 0 18px; }
- .card { background:#121824; border:1px solid #1e2633; border-radius:16px; padding:20px; margin-bottom:18px; }
- label { display:block; font-size:14px; color:#A9B4C6; margin:8px 0 6px; }
- input[type="text"], textarea { width:100%; background:#0b1018; color:#dbe4f0; border:1px solid #223044; border-radius:10px; padding:10px 12px; outline:none; }
- textarea { min-height: 110px; }
- .row { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
- .btn { background:#2563eb; color:white; border:none; padding:12px 16px; border-radius:12px; cursor:pointer; font-weight:600; }
- small { color:#93a1b7; } .muted { color:#93a1b7; font-size:12px; } .pill { display:inline-block; padding:2px 8px; background:#102033; border:1px solid #223044; border-radius:999px; margin-right:6px; font-size:12px; color:#B8C4D9;}
- a{ color:#7aa0ff; text-decoration:none;}
- table{width:100%; border-collapse:collapse;}
- th,td{border-bottom:1px solid #1f2b3d; padding:8px 6px; text-align:left; vertical-align:top; font-size:13px;}
-</style></head><body><div class="wrap">
-  <h1>Alsos Talent · 合规AI自动化寻访（MVP）</h1>
-  <div class="card"><p class="muted">说明：本工具<strong>不做</strong>对 LinkedIn/猎聘 的自动点开或抓取；仅对你<strong>合规导出</strong>的 ZIP/PDF/HTML/CSV/文本做AI分析、排序并导出Excel。</p></div>
-  <form action="/process" method="post" enctype="multipart/form-data">
-    <div class="card"><h3>上传候选集（支持多文件）</h3>
-      <label>选择文件（.zip .pdf .html/.htm .docx .txt .csv）：</label>
-      <input type="file" name="files" multiple required />
-      <small>可直接上传 Recruiter Lite 25人/包的 ZIP（一次多包）。</small>
+INDEX_HTML = r"""<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Alsos Talent · 批量简历分析 MVP</title>
+  <style>
+    body { font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial; margin:0; background:#0b0f14; color:#e3e8f2;}
+    .wrap { max-width: 960px; margin: 24px auto; padding: 0 16px; }
+    h1 { font-size: 22px; margin: 12px 0 18px; }
+    .card { background:#121824; border:1px solid #1e2633; border-radius:16px; padding:20px; margin-bottom:18px; }
+    label { display:block; font-size:14px; color:#A9B4C6; margin:8px 0 6px; }
+    input[type="text"], input[type="file"], textarea { width:100%; background:#0b1018; color:#dbe4f0; border:1px solid #223044; border-radius:10px; padding:10px 12px; outline:none; }
+    textarea { min-height: 100px; }
+    .row { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
+    .btn { background:#2563eb; color:white; border:none; padding:12px 16px; border-radius:12px; cursor:pointer; font-weight:600; }
+    small { color:#93a1b7; font-size:12px; }
+    .muted { color:#93a1b7; font-size:13px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Alsos Talent · 批量简历分析（MVP）</h1>
+    <div class="card">
+      <p class="muted">说明：请上传合规导出的候选人简历（ZIP/PDF/HTML/DOCX/TXT/CSV）。系统会调用大模型进行解析，输出排序表格和报告。</p>
     </div>
-    <div class="card"><h3>岗位/筛选要求</h3>
-      <div class="row">
-        <div><label>职位名称 / 方向</label><input type="text" name="role" placeholder="例如：云原生/平台架构负责人"/></div>
-        <div><label>最低年限</label><input type="text" name="min_years" placeholder="例如：8 或 10-15"/></div>
+
+    <form action="/process" method="post" enctype="multipart/form-data">
+
+      <div class="card">
+        <h3>上传候选人简历</h3>
+        <label>选择文件（支持多文件 / ZIP 批量）：</label>
+        <input type="file" name="files" multiple required />
+        <small>支持 Recruiter Lite 每页25人导出的 ZIP，可以一次上传多个包。</small>
       </div>
-      <div class="row">
-        <div><label>Must-have关键词（逗号分隔）</label><input type="text" name="must" placeholder="例如：K8s, DevOps, 安全合规"/></div>
-        <div><label>Nice-to-have关键词（逗号分隔）</label><input type="text" name="nice" placeholder="例如：HPC, 监管合规, 金融行业"/></div>
+
+      <div class="card">
+        <h3>上传 JD（可选）</h3>
+        <label>选择 JD 文件（.pdf/.docx/.txt）：</label>
+        <input type="file" name="jdfile" />
+        <small>如提供 JD，将启用 JD 定向匹配模式；未上传则进行通用简历亮点评估。</small>
       </div>
-      <div class="row">
-        <div><label>学历/学校偏好（选填）</label><input type="text" name="edu" placeholder="例如：硕士/博士优先；985/211"/></div>
-        <div><label>地域/签证等限制（选填）</label><input type="text" name="location" placeholder="例如：上海/苏州；可出差；英文流利"/></div>
+
+      <div class="card">
+        <h3>岗位/筛选要求</h3>
+        <div class="row">
+          <div><label>职位名称</label><input type="text" name="role" placeholder="如：资深基础设施架构师" required /></div>
+          <div><label>方向（选填）</label><input type="text" name="direction" placeholder="如：Infra / SRE / 医疗IT" /></div>
+        </div>
+        <div class="row">
+          <div><label>最低年限</label><input type="text" name="min_years" placeholder="如：8 或 10-15" /></div>
+          <div><label>地域/签证限制</label><input type="text" name="location" placeholder="如：上海/苏州；英文流利" /></div>
+        </div>
+        <div class="row">
+          <div><label>Must-have关键词</label><input type="text" name="must" placeholder="如：K8s, DevOps, 合规" /></div>
+          <div><label>Nice-to-have关键词</label><input type="text" name="nice" placeholder="如：HPC, 金融, 医药" /></div>
+        </div>
+        <label>补充说明</label>
+        <textarea name="note" placeholder="如：优先有从0-1平台建设经验；避免频繁跳槽。"></textarea>
       </div>
-      <label>补充说明（用于指导AI评估）</label><textarea name="note" placeholder="例如：优先有从0→1平台建设经验；避免频繁跳槽。"></textarea>
-    </div>
-    <div class="card"><h3>模型与并发</h3>
-      <div class="row">
-        <div><label>模型名称 <small>(默认 {{model_name}})</small></label><input type="text" name="model_name" value="{{model_name}}"/></div>
-        <div><label>每批次并发 <small>(默认 {{max_workers}})</small></label><input type="text" name="workers" value="{{max_workers}}"/></div>
+
+      <div class="card">
+        <h3>模型与并发</h3>
+        <div class="row">
+          <div><label>模型名称 <small>(默认 {{model_name}})</small></label>
+            <input type="text" name="model_name" value="{{model_name}}"/>
+          </div>
+          <div><label>每批次并发 <small>(默认 {{max_workers}})</small></label>
+            <input type="text" name="workers" value="{{max_workers}}"/>
+          </div>
+        </div>
+        <small>需在 Render 配置环境变量：MODEL_API_KEY / MODEL_BASE_URL / MODEL_NAME。</small>
       </div>
-      <small>Render 环境变量需配置：MODEL_API_KEY / MODEL_BASE_URL / MODEL_NAME。</small>
-    </div>
-    <div class="card"><button class="btn" type="submit">开始分析（生成Excel清单）</button>
-      <small>提交后会跳到“实时报告”页面，边分析边输出。</small>
-    </div>
-  </form>
+
+      <div class="card">
+        <button class="btn" type="submit">开始分析（生成 Excel 清单）</button>
+        <small>提交后会跳转到实时报告页面，边分析边输出。</small>
+      </div>
+
+    </form>
+  </div>
+</body>
+</html>"""
+
 
 EVENTS_HTML = """
 <!doctype html>
