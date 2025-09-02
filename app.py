@@ -1,10 +1,9 @@
 # app.py
-import os, io, re, json, zipfile, shutil, time, uuid, math, logging, tempfile
+import os, re, json, zipfile, time, logging
 from datetime import datetime
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from queue import Queue, Empty
-from urllib.parse import quote_plus
 
 import requests
 from flask import Flask, request, Response, send_file, render_template_string, redirect, url_for
@@ -38,8 +37,6 @@ DATA_DIR = os.path.abspath("./data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
 app = Flask(__name__)
-
-# rid -> 运行态
 RUNS: Dict[str, Dict[str, Any]] = {}
 
 # ---------- HTML ----------
@@ -79,7 +76,6 @@ ul.files li button{background:#334155;color:#cbd5e1;border:0;border-radius:8px;p
 
   <form id="f" action="/process" method="post" enctype="multipart/form-data">
     <div class="card">
-      <h3 style="margin:0 0 8px">岗位/筛选要求</h3>
       <div class="row">
         <div>
           <label>职位名称（必填）</label>
@@ -90,28 +86,23 @@ ul.files li button{background:#334155;color:#cbd5e1;border:0;border-radius:8px;p
           <input name="track" placeholder="如：Infra / SRE / 医疗IT">
         </div>
       </div>
+
       <div class="row">
         <div>
-          <label>最低年限</label>
-          <input name="min_years" placeholder="如：8 或 10-15">
+          <label>Must-have 关键词（逗号分隔）</label>
+          <input name="must" placeholder="如：K8s, DevOps, 合规"/>
         </div>
         <div>
-          <label>年龄要求</label>
-          <input name="age_req" placeholder="如：30-40；或不超过38；留空为不限">
+          <label>Nice-to-have 关键词（逗号分隔）</label>
+          <input name="nice" placeholder="如：HPC, 金融, 医药"/>
         </div>
       </div>
-      <div class="row">
-        <div>
-          <label>Must-have关键词（逗号分隔）</label>
-          <input name="must" placeholder="如：K8s, DevOps, 安全合规">
-        </div>
-        <div>
-          <label>Nice-to-have关键词（逗号分隔）</label>
-          <input name="nice" placeholder="如：HPC, 监管合规, 金融行业">
-        </div>
-      </div>
-      <label>补充说明（可粘贴JD要点）</label>
-      <textarea name="note" placeholder="可写关键点、must-have、过滤条件等"></textarea>
+
+      <label>限制说明（地域/签证/语言等）</label>
+      <input name="limits" placeholder="如：上海/苏州；英文流利；可出差"/>
+
+      <label style="margin-top:10px">补充说明（可粘贴JD要点）</label>
+      <textarea name="note" placeholder="可写关键点、筛选口径、其他背景要求等"></textarea>
     </div>
 
     <div class="card">
@@ -133,7 +124,6 @@ ul.files li button{background:#334155;color:#cbd5e1;border:0;border-radius:8px;p
 const file = document.getElementById('file');
 const flist = document.getElementById('flist');
 file.addEventListener('change', refreshList);
-
 function refreshList(){
   flist.innerHTML='';
   const dt = new DataTransfer();
@@ -221,12 +211,12 @@ th,td{border-bottom:1px solid var(--border);padding:8px 6px;text-align:left;vert
     {% for row in rows %}
       <tr>
         <td>{{ loop.index }}</td>
-        <td>{{ row.get('name','') }}</td>
-        <td>{{ row.get('current_company','') }} / {{ row.get('current_title','') }}</td>
-        <td><span class="badge">{{ row.get('grade','') }}</span></td>
-        <td>{{ row.get('score','') }}</td>
-        <td>{{ row.get('email','') }}</td>
-        <td>{{ row.get('remark','') }}</td>
+        <td>{{row.get('name','')}}</td>
+        <td>{{row.get('current_company','')}} / {{row.get('current_title','')}}</td>
+        <td><span class="badge">{{row.get('grade','')}}</span></td>
+        <td>{{row.get('score','')}}</td>
+        <td>{{row.get('email','')}}</td>
+        <td>{{row.get('remark','')}}</td>
       </tr>
     {% endfor %}
     </tbody>
@@ -234,8 +224,7 @@ th,td{border-bottom:1px solid var(--border);padding:8px 6px;text-align:left;vert
 </div></body></html>
 """
 
-
-# ---------- 工具函数 ----------
+# ---------- 工具 ----------
 def slugify(text: str) -> str:
     s = re.sub(r"[^\w\s-]+", "", text, flags=re.U).strip().lower()
     s = re.sub(r"[-\s]+", "_", s)
@@ -252,13 +241,12 @@ def ensure_run(rid:str) -> Dict[str,Any]:
 def put(rid: str, msg: str):
     RUNS.get(rid, {}).get("q", Queue()).put(msg)
 
-# ---------- 解析 ----------
 def text_from_file(path:str) -> str:
     ext = os.path.splitext(path)[1].lower()
     try:
-        if ext in (".pdf",) and pdf_extract_text:
+        if ext == ".pdf" and pdf_extract_text:
             return pdf_extract_text(path) or ""
-        if ext in (".docx",) and docx:
+        if ext == ".docx" and docx:
             return "\n".join(p.text for p in docx.Document(path).paragraphs)
         if ext in (".html",".htm") and BeautifulSoup:
             with open(path,"rb") as f:
@@ -271,28 +259,35 @@ def text_from_file(path:str) -> str:
         return ""
 
 EMAIL_RE = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.I)
-
 def extract_email(text:str) -> str:
     m = EMAIL_RE.search(text)
     return m.group(0) if m else ""
 
+def estimate_age_from_edu(education: Any) -> str:
+    """本科入学年+18做粗估；无信息返回“不详”"""
+    try:
+        year = None
+        if isinstance(education, list):
+            for e in education:
+                deg = (e.get("degree","") or "").lower()
+                st  = str(e.get("start","") or "")
+                if ("bachelor" in deg) or ("本科" in deg):
+                    m = re.search(r"(19|20)\\d{2}", st)
+                    if m: year = int(m.group(0)); break
+        if year:
+            now = datetime.now().year
+            return str(max(18, now - year + 18))
+    except Exception:
+        pass
+    return "不详"
+
 def llm_chat(messages: List[Dict[str,str]], temperature: float=0.2, max_tokens:int=1024) -> str:
-    """
-    统一的 LLM 调用（DeepSeek/OpenAI 兼容）：
-    base_url + /v1/chat/completions，避免 /v1/v1。
-    """
     if not MODEL_API_KEY or not MODEL_BASE_URL:
         return ""
-
     url = f"{MODEL_BASE_URL}/v1/chat/completions"
     headers = {"Authorization": f"Bearer {MODEL_API_KEY}", "Content-Type": "application/json"}
-    payload = {
-        "model": MODEL_NAME,
-        "messages": messages,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-        "stream": False
-    }
+    payload = {"model": MODEL_NAME, "messages": messages, "temperature": temperature,
+               "max_tokens": max_tokens, "stream": False}
     try:
         r = requests.post(url, headers=headers, json=payload, timeout=60)
         r.raise_for_status()
@@ -303,26 +298,27 @@ def llm_chat(messages: List[Dict[str,str]], temperature: float=0.2, max_tokens:i
         return ""
 
 PROMPT_SYS = (
-"你是资深猎头助理，负责把候选人简历文本结构化并做岗位匹配，输出严格 JSON。"
-"字段：name, current_company, current_title, email, location, age_estimate, "
-"education(list:{school,major,degree,start,end}), "
-"experiences(list:{company,title,start,end,one_line}), "
-"fit_summary(50字内), risks(50字内), "
-"remark(按时间线的中文概述：xxxx-xxxx 学校/专业/学历；xxxx-xxxx 公司/职位/一句话职责…，尽量补全), "
-"score(0-100), grade(A+/A/B/C)。"
-"打分口径：匹配 must-have 与方向；近3年经验与岗位相关度；平台/影响力；年限与年龄要求；nice-to-have 加分。"
-"年龄预估：若有本科起止时间，按18岁入学、22岁毕业推算当前年龄；没有教育时间则写“不详”。"
-"若简历未给出 email，从文本中抽取；不要电话。"
+"你是资深猎头助理。请基于候选人简历文本，输出**严格合法的 JSON**，并做岗位匹配。\n"
+"字段：\n"
+"name, current_company, current_title, email, location,\n"
+"age_estimate, tags(list),\n"
+"education(list:{school,major,degree,start,end}),\n"
+"experiences(list:{company,title,start,end,one_line}),\n"
+"fit_summary(中文，概括与岗位的契合要点),\n"
+"risks(中文，概括潜在风险/短板),\n"
+"remark(中文时间线：如“2012-2016年 就读于XX大学/计算机 本科；2016-2020年 就职于XX公司/工程师，主要负责XXX”，≤120字),\n"
+"score(0-100 数值), grade(A+/A/B/C)。\n"
+"打分口径：关键词匹配度 + 最近3年经验相关性 + 平台/影响力。\n"
+"若简历无邮箱，可从文本中正则抽取；不要电话。"
 )
 
-def build_messages(cfg: Dict[str,str], text:str)->List[Dict[str,str]]:
-    user = f"""岗位：{cfg.get('role')}
-方向：{cfg.get('track')}
-最低年限：{cfg.get('min_years')}
-年龄要求：{cfg.get('age_req')}
-Must-have：{cfg.get('must')}
-Nice-to-have：{cfg.get('nice')}
-补充说明：{cfg.get('note')}
+def build_messages(role:str, track:str, note:str, limits:str, must:str, nice:str, text:str)->List[Dict[str,str]]:
+    user = f"""岗位：{role}
+方向：{track}
+限制：{limits}
+Must-have：{must}
+Nice-to-have：{nice}
+补充说明：{note}
 
 候选人简历文本：
 {text}
@@ -339,11 +335,10 @@ def grade_from_score(s: float) -> str:
     if s >= 70: return "B"
     return "C"
 
-# ---------- 处理主逻辑 ----------
+# ---------- 主流程 ----------
 def handle_zip_or_file(upload_path: str, work_dir:str) -> List[str]:
     files = []
-    name = os.path.basename(upload_path)
-    base,ext = os.path.splitext(name)
+    base,ext = os.path.splitext(os.path.basename(upload_path))
     if ext.lower()==".zip":
         try:
             with zipfile.ZipFile(upload_path) as z:
@@ -358,10 +353,10 @@ def handle_zip_or_file(upload_path: str, work_dir:str) -> List[str]:
         files.append(upload_path)
     return files
 
-def process_resume(path:str, cfg:Dict[str,str])->Dict[str,Any]:
+def process_resume(path:str, role:str, track:str, note:str, limits:str, must:str, nice:str)->Dict[str,Any]:
     text = text_from_file(path)
     email = extract_email(text)
-    msg = build_messages(cfg, text[:12000])
+    msg = build_messages(role,track,note,limits,must,nice,text[:12000])
     content = llm_chat(msg, temperature=0.2, max_tokens=900)
     data = {}
     if content:
@@ -376,20 +371,28 @@ def process_resume(path:str, cfg:Dict[str,str])->Dict[str,Any]:
                 data = json.loads(re.sub(r"```json|```","",content2).strip())
             except Exception:
                 data = {}
-    # 兜底
+    # 兜底字段
     data["email"] = data.get("email") or email or ""
-    data["name"]  = data.get("name") or ""
+    data["name"]  = (data.get("name") or "").strip() or os.path.splitext(os.path.basename(path))[0]
     data["current_company"] = data.get("current_company") or ""
     data["current_title"]   = data.get("current_title") or ""
     data["remark"] = data.get("remark") or ""
+    data["fit_summary"] = data.get("fit_summary") or ""
+    data["risks"] = data.get("risks") or ""
+
+    # 年龄估算兜底
+    if not data.get("age_estimate"):
+        data["age_estimate"] = estimate_age_from_edu(data.get("education"))
+
     # 分数与等级
-    sc = data.get("score")
     try:
-        sc = float(sc)
+        sc = float(data.get("score", 0))
     except:
         sc = 0.0
     data["score"] = round(sc,1)
     data["grade"] = grade_from_score(sc)
+
+    # 去重签名
     data["_sig"] = (data["name"].strip().lower(), data["current_company"].strip().lower())
     return data
 
@@ -420,7 +423,7 @@ def write_excel(rows: List[Dict[str,Any]], xlsx_path:str):
             ", ".join(r.get("tags",[]) or []),
             r.get("remark",""),
         ])
-    # 列宽
+
     for col in ws.columns:
         ws.column_dimensions[col[0].column_letter].width = 18
     ws.column_dimensions['I'].width = 28
@@ -434,23 +437,18 @@ def index():
 
 @app.route("/process", methods=["POST"])
 def process():
-    role  = (request.form.get("role") or "").strip()
+    role   = (request.form.get("role") or "").strip()
+    track  = (request.form.get("track") or "").strip()
+    note   = (request.form.get("note") or "").strip()
+    limits = (request.form.get("limits") or "").strip()
+    must   = (request.form.get("must") or "").strip()
+    nice   = (request.form.get("nice") or "").strip()
     if not role:
         return ("职位名称必填", 400)
 
-    cfg = {
-        "role"     : role,
-        "track"    : (request.form.get("track") or "").strip(),
-        "min_years": (request.form.get("min_years") or "").strip(),
-        "age_req"  : (request.form.get("age_req") or "").strip(),
-        "must"     : (request.form.get("must") or "").strip(),
-        "nice"     : (request.form.get("nice") or "").strip(),
-        "note"     : (request.form.get("note") or "").strip(),
-    }
-
     rid = f"{slugify(role)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     run = ensure_run(rid)
-    run["role"], run["track"], run["name"] = role, cfg["track"], rid
+    run["role"], run["track"], run["name"] = role, track, rid
 
     work_dir = run["dir"]
     up_dir   = os.path.join(work_dir,"uploads")
@@ -466,8 +464,8 @@ def process():
         sz_total += len(b)
         if sz_total > MAX_UPLOAD_MB*1024*1024:
             return (f"总大小超过限制 {MAX_UPLOAD_MB}MB", 400)
-        p = os.path.join(up_dir, f.filename)
-        with open(p,"wb") as o: o.write(b)
+        with open(os.path.join(up_dir, f.filename), "wb") as o:
+            o.write(b)
 
     def runner():
         try:
@@ -479,14 +477,12 @@ def process():
             todo = sorted(set(todo))
             put(rid, f"解析 待办 {len(todo)} 个文件")
 
-            results = []
-            seen = set()
-            from concurrent.futures import ThreadPoolExecutor, as_completed
+            results, seen = [], set()
             with ThreadPoolExecutor(max_workers=CONCURRENCY) as ex:
-                futs = [ex.submit(process_resume, p, cfg) for p in todo]
-                for i,f in enumerate(as_completed(futs), start=1):
+                futs = [ex.submit(process_resume, p, role, track, note, limits, must, nice) for p in todo]
+                for i,fut in enumerate(as_completed(futs), start=1):
                     try:
-                        d = f.result()
+                        d = fut.result()
                     except Exception as e:
                         d = {}
                         logging.warning("worker error: %s", e)
@@ -517,7 +513,6 @@ def process():
 
     from threading import Thread
     Thread(target=runner, daemon=True).start()
-
     return redirect(url_for("events", rid=rid))
 
 @app.route("/events/<rid>")
@@ -529,16 +524,14 @@ def events(rid):
 def stream(rid):
     run = ensure_run(rid)
     q: Queue = run["q"]
-
     def gen():
-        yield "data: 连接已建立\\n\\n"
+        yield "data: 连接已建立\n\n"
         while True:
             try:
                 msg = q.get(timeout=15)
-                yield f"data: {msg}\\n\\n"
+                yield f"data: {msg}\n\n"
             except Empty:
-                yield "data: \\n\\n"
-
+                yield "data: \n\n"
     headers = {
         "Content-Type":"text/event-stream",
         "Cache-Control":"no-cache",
