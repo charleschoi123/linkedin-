@@ -218,21 +218,22 @@ th,td{border-bottom:1px solid var(--border);padding:8px 6px;text-align:left;vert
       <th>排名</th><th>候选人</th><th>公司/职位</th><th>等级</th><th>分数</th><th>Email</th><th>摘要</th>
     </tr></thead>
     <tbody>
-    {% for i,row in enumerate(rows, start=1) %}
+    {% for row in rows %}
       <tr>
-        <td>{{i}}</td>
-        <td>{{row.get('name','')}}</td>
-        <td>{{row.get('current_company','')}} / {{row.get('current_title','')}}</td>
-        <td><span class="badge">{{row.get('grade','')}}</span></td>
-        <td>{{row.get('score','')}}</td>
-        <td>{{row.get('email','')}}</td>
-        <td>{{row.get('remark','')}}</td>
+        <td>{{ loop.index }}</td>
+        <td>{{ row.get('name','') }}</td>
+        <td>{{ row.get('current_company','') }} / {{ row.get('current_title','') }}</td>
+        <td><span class="badge">{{ row.get('grade','') }}</span></td>
+        <td>{{ row.get('score','') }}</td>
+        <td>{{ row.get('email','') }}</td>
+        <td>{{ row.get('remark','') }}</td>
       </tr>
     {% endfor %}
     </tbody>
   </table>
 </div></body></html>
 """
+
 
 # ---------- 工具函数 ----------
 def slugify(text: str) -> str:
