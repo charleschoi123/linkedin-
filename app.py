@@ -1,94 +1,63 @@
-# app.py
-# Alsos Talent · 合规AI自动化寻访（MVP）
-# - 仅分析你合规导出的 ZIP/PDF/DOCX/HTML/TXT/CSV
-# - 模型与并发走环境变量，UI 不暴露，便于商业化
-# - 实时 SSE 流式报告、断点续跑、去重、A+/A/B/C 评分、Excel 导出
-# - 任务目录命名：职位_方向_YYYYMMDD_HHMMSS
-
-import os, io, re, json, zipfile, uuid, time, hashlib, logging, csv
+import os, io, re, json, zipfile, time, uuid, hashlib, logging, csv
 from datetime import datetime
 from typing import List, Dict, Any, Optional
-from queue import Queue
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from queue import Queue, Empty as QEmpty
+from threading import Thread
+from flask import Flask, request, Response, send_file, redirect
 
-from flask import Flask, request, Response, send_file, redirect, url_for, render_template_string
+# ------------- 环境开关（对用户隐藏）-------------
+MODEL_BASE_URL = os.getenv("MODEL_BASE_URL", "").strip()
+MODEL_API_KEY  = os.getenv("MODEL_API_KEY", "").strip()
+MODEL_NAME     = os.getenv("MODEL_NAME", "deepseek-chat").strip()
 
-import requests
-from bs4 import BeautifulSoup
+CONCURRENCY    = int(os.getenv("CONCURRENCY", "2"))           # 并发(worker)数
+MAX_UPLOAD_MB  = int(os.getenv("MAX_UPLOAD_MB", "200"))       # Render 免费版 512MB 上限，保守用 200
+WORK_DIR       = "/tmp/alsos_jobs"                            # 任务根目录
+os.makedirs(WORK_DIR, exist_ok=True)
 
-# 可选解析器
-try:
-    from pdfminer.high_level import extract_text as pdf_extract_text
-except Exception:
-    pdf_extract_text = None
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("alsos")
 
-try:
-    import docx
-except Exception:
-    docx = None
+# ------------- 内存任务表 -------------
+JOBS: Dict[str, Dict[str, Any]] = {}  # rid -> {q, created, name, folder, status, last}
 
-from openpyxl import Workbook
-
-# =========================
-# 环境变量（隐藏给用户）
-# =========================
-MODEL_BASE_URL = os.getenv("MODEL_BASE_URL", "").rstrip("/")
-MODEL_API_KEY  = os.getenv("MODEL_API_KEY", "")
-MODEL_NAME     = os.getenv("MODEL_NAME", "deepseek-chat")
-MAX_WORKERS    = int(os.getenv("CONCURRENCY", os.getenv("MAX_WORKERS", "2")))
-MAX_UPLOAD_MB  = int(os.getenv("MAX_UPLOAD_MB", "200"))
-
-assert MODEL_API_KEY and MODEL_BASE_URL, "请配置环境变量 MODEL_API_KEY / MODEL_BASE_URL"
-
-# =========================
-# Flask 基础
-# =========================
-app = Flask(__name__)
-logging.basicConfig(level=logging.INFO)
-
-DATA_DIR = os.path.abspath("data")
-os.makedirs(DATA_DIR, exist_ok=True)
-
-JOBS: Dict[str, Dict[str, Any]] = {}   # rid -> {q, created, name, folder, files, results, done, params}
-
-# =========================
-# 前端：极简表单（支持文件 x 删除）
-# =========================
-INDEX_HTML = """<!DOCTYPE html>
-<html lang="zh">
+# ------------- HTML 模板（极简 UI+可删文件+历史任务）-------------
+INDEX_HTML = r"""
+<!doctype html><html lang="zh">
 <head>
-  <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width,initial-scale=1"/>
-  <title>Alsos Talent · 合规AI自动化寻访（MVP）</title>
-  <style>
-    body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial;margin:0;background:#0b0f14;color:#e3e8f2}
-    .wrap{max-width:980px;margin:28px auto;padding:0 16px}
-    .card{background:#121824;border:1px solid #1e2633;border-radius:16px;padding:20px;margin-bottom:18px}
-    label{display:block;font-size:14px;color:#A9B4C6;margin:8px 0 6px}
-    input[type="text"],textarea{width:100%;background:#0b1018;color:#dbe4f0;border:1px solid #223044;border-radius:10px;padding:10px 12px;outline:none}
-    textarea{min-height:120px}
-    .row{display:grid;grid-template-columns:1fr 1fr;gap:16px}
-    .btn{background:#2563eb;color:#fff;border:none;padding:12px 16px;border-radius:12px;cursor:pointer;font-weight:600}
-    small{color:#93a1b7}
-    .files{margin-top:8px}
-    .file-pill{display:inline-flex;align-items:center;gap:6px;margin:4px 6px 0 0;padding:4px 8px;border-radius:999px;background:#0c1320;border:1px solid #223044;font-size:12px}
-    .file-pill button{background:transparent;color:#9db3ff;border:none;cursor:pointer}
-    .error{color:#ff8181;margin-top:6px}
-    a{color:#89aaff;text-decoration:none}
-  </style>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Alsos Talent · 合规AI自动化寻访（MVP）</title>
+<style>
+ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial;margin:0;background:#0b0f14;color:#e3e8f2}
+ .wrap{max-width:980px;margin:26px auto;padding:0 16px}
+ h1{font-size:22px;margin:6px 0 18px}
+ .card{background:#121824;border:1px solid #1e2633;border-radius:16px;padding:20px;margin-bottom:18px}
+ label{display:block;font-size:14px;color:#A9B4C6;margin:8px 0 6px}
+ input[type="text"],textarea{width:100%;background:#0b1018;color:#dbe4f0;border:1px solid #223044;border-radius:10px;padding:10px 12px;outline:none}
+ textarea{min-height:110px}
+ .row{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+ .btn{background:#2563eb;color:#fff;border:none;padding:12px 16px;border-radius:12px;cursor:pointer;font-weight:600}
+ .muted{color:#92a1b7;font-size:12px}
+ .pill{display:inline-block;padding:2px 8px;background:#102033;border:1px solid #223044;border-radius:999px;margin-right:6px;font-size:12px;color:#B8C4D9}
+ ul.files{list-style:none;padding:0;margin:8px 0 0}
+ ul.files li{display:flex;justify-content:space-between;align-items:center;padding:6px 10px;background:#0b1018;border:1px solid #223044;border-radius:8px;margin-top:6px}
+ a{color:#7aa0ff;text-decoration:none}
+</style>
 </head>
 <body>
 <div class="wrap">
-  <h2>linkedin-批量简历分析（合规版）</h2>
+  <h1>Alsos Talent · 合规AI自动化寻访（MVP）</h1>
 
-  <form action="/process" method="post" enctype="multipart/form-data" onsubmit="return guardSubmit();">
+  <div class="card">
+    <p class="muted">说明：本工具<strong>不做</strong>对 LinkedIn/猎聘 的自动点开或抓取；仅对你<strong>合规导出</strong>的 ZIP/PDF/HTML/DOCX/CSV/TXT 进行 AI 解析、去重、排序并导出 Excel。</p>
+  </div>
+
+  <form id="f" action="/process" method="post" enctype="multipart/form-data" onsubmit="return submitForm()">
     <div class="card">
       <h3>上传候选集（支持多文件）</h3>
-      <label>选择文件（.zip .pdf .html/.htm .docx .txt .csv）：</label>
-      <input id="fileInput" type="file" name="files" multiple />
-      <div id="fileList" class="files"></div>
-      <small>可直接上传 Recruiter Lite 的 25人/包 ZIP（可多包）。若传错，可在下方‘×’删除重选。</small>
-      <div id="fileErr" class="error" style="display:none;">请至少选择 1 个文件</div>
+      <input id="file" type="file" name="files" multiple required accept=".zip,.pdf,.docx,.html,.htm,.txt,.csv"/>
+      <ul id="fileList" class="files"></ul>
+      <small class="muted">可直接上传 Recruiter Lite 25人/包的 ZIP（可一次多包）。支持 PDF/HTML/DOCX/TXT/CSV 混合上传。</small>
     </div>
 
     <div class="card">
@@ -96,49 +65,49 @@ INDEX_HTML = """<!DOCTYPE html>
       <div class="row">
         <div>
           <label>职位名称（必填）</label>
-          <input type="text" name="role" id="role" placeholder="如：资深基础设施架构师" required />
+          <input type="text" name="role" id="role" placeholder="如：资深基础设施架构师" required/>
         </div>
         <div>
           <label>方向（选填）</label>
-          <input type="text" name="direction" placeholder="如：Infra / SRE / 医疗IT" />
+          <input type="text" name="direction" placeholder="如：Infra / SRE / 医疗IT"/>
         </div>
       </div>
       <div class="row">
         <div>
           <label>最低年限（选填）</label>
-          <input type="text" name="min_years" placeholder="如：8 或 10-15" />
+          <input type="text" name="min_years" placeholder="如：8 或 10-15"/>
         </div>
         <div>
           <label>地域/签证限制（选填）</label>
-          <input type="text" name="location" placeholder="如：上海/苏州；英文流利" />
+          <input type="text" name="location" placeholder="如：上海/苏州；英文流利"/>
         </div>
       </div>
       <div class="row">
         <div>
           <label>Must-have 关键词（逗号分隔）</label>
-          <input type="text" name="must" placeholder="如：K8s, DevOps, 合规" />
+          <input type="text" name="must" placeholder="如：K8s, DevOps, 合规"/>
         </div>
         <div>
           <label>Nice-to-have 关键词（逗号分隔）</label>
-          <input type="text" name="nice" placeholder="如：HPC, 金融, 医药" />
+          <input type="text" name="nice" placeholder="如：HPC, 金融, 医药"/>
         </div>
       </div>
-      <label>补充说明（可直接粘贴 JD 文本）</label>
-      <textarea name="note" placeholder="例如：JD 整体要求/一句话职责，或粘贴完整 JD。"></textarea>
+      <label>补充说明（可直接粘贴 JD 全文）</label>
+      <textarea name="note" placeholder="如：优先有从0→1平台建设经验；避免频繁跳槽。"></textarea>
     </div>
 
     <div class="card">
-      <button class="btn" type="submit">开始分析（生成 Excel 清单）</button>
-      <small>提交后会跳到“实时报告”，边解析边输出；Render 免费实例若空闲会有冷启动延迟。</small>
+      <button class="btn" type="submit">开始分析（生成Excel清单）</button>
+      <small class="muted">提交后会跳到“实时报告”页面；如断开可从首页历史任务继续。</small>
     </div>
   </form>
 
   {% if jobs %}
   <div class="card">
-    <h3>历史报告（可继续）</h3>
+    <h3>历史任务</h3>
     <ul>
-      {% for rid, info in jobs %}
-        <li><a href="/events/{{rid}}">继续 / 查看：{{info['name']}}</a>（{{info['created']}}）</li>
+      {% for rid,info in jobs %}
+        <li><a href="/events/{{rid}}">继续 / 查看：{{info['name']}}</a> <span class="muted">（{{info['created']}}）</span></li>
       {% endfor %}
     </ul>
   </div>
@@ -146,476 +115,457 @@ INDEX_HTML = """<!DOCTYPE html>
 </div>
 
 <script>
-  const input = document.getElementById('fileInput');
-  const list  = document.getElementById('fileList');
-  const err   = document.getElementById('fileErr');
+const fileInput = document.getElementById('file');
+const fileList = document.getElementById('fileList');
+let dt = new DataTransfer();
 
-  function renderFiles(files){
-    list.innerHTML = '';
-    [...files].forEach((f, idx) => {
-      const pill = document.createElement('span');
-      pill.className = 'file-pill';
-      pill.innerHTML = `${f.name} <button type="button" aria-label="移除" data-i="${idx}">×</button>`;
-      list.appendChild(pill);
-    });
-  }
-  function rebuildFiles(skipIndex){
-    const dt = new DataTransfer();
-    [...input.files].forEach((f, i) => { if(i !== skipIndex) dt.items.add(f); });
-    input.files = dt.files; renderFiles(input.files);
-  }
-  input.addEventListener('change', () => { err.style.display='none'; renderFiles(input.files); });
-  list.addEventListener('click', (e) => { if(e.target.tagName==='BUTTON'){ rebuildFiles(Number(e.target.dataset.i)); } });
+fileInput.addEventListener('change', () => {
+  // 重新以 DataTransfer 管理 files，才能删除单个
+  for (const f of fileInput.files) dt.items.add(f);
+  render();
+});
 
-  function guardSubmit(){
-    if(!document.getElementById('role').value.trim()){ alert('请填写职位名称'); return false; }
-    if(input.files.length===0){ err.style.display='block'; return false; }
-    return true;
+function render(){
+  fileList.innerHTML = '';
+  for (let i=0;i<dt.files.length;i++){
+    const li = document.createElement('li');
+    li.innerHTML = '<span>'+ dt.files[i].name +'</span><button type="button" class="btn" style="padding:6px 10px;border-radius:8px;background:#1f2a44" onclick="del('+i+')">删除</button>';
+    fileList.appendChild(li);
   }
+  fileInput.files = dt.files;
+}
+
+function del(idx){
+  const ndt = new DataTransfer();
+  for (let i=0;i<dt.files.length;i++){
+    if (i!==idx) ndt.items.add(dt.files[i]);
+  }
+  dt = ndt; render();
+}
+
+function submitForm(){
+  if (!document.getElementById('role').value.trim()){
+    alert('职位名称必填'); return false;
+  }
+  if (dt.files.length===0){ alert('请至少选择一个文件'); return false; }
+  // 将 DataTransfer 内容重新回填给 input
+  fileInput.files = dt.files;
+  return true;
+}
 </script>
-</body>
-</html>
+</body></html>
 """
 
-EVENTS_HTML = """<!doctype html>
-<html lang="zh">
+EVENTS_HTML = r"""
+<!doctype html><html lang="zh">
 <head>
-  <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width,initial-scale=1"/>
-  <title>实时报告</title>
-  <style>
-    body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial;margin:0;background:#0b0f14;color:#e3e8f2}
-    .wrap{max-width:980px;margin:20px auto;padding:0 16px}
-    .card{background:#121824;border:1px solid #1e2633;border-radius:16px;padding:20px;margin-bottom:18px}
-    pre{white-space:pre-wrap;word-break:break-word}
-    .btn{background:#2563eb;color:#fff;border:none;padding:10px 14px;border-radius:10px;cursor:pointer}
-    a{color:#89aaff;text-decoration:none}
-  </style>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>任务 {{rid}} · 实时报告</title>
+<style>
+ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial;margin:0;background:#0b0f14;color:#e3e8f2}
+ .wrap{max-width:980px;margin:26px auto;padding:0 16px}
+ h1{font-size:22px;margin:6px 0 18px}
+ .card{background:#121824;border:1px solid #1e2633;border-radius:16px;padding:20px}
+ pre{white-space:pre-wrap;word-break:break-word}
+ .btn{background:#2563eb;color:#fff;border:none;padding:10px 14px;border-radius:10px;cursor:pointer}
+</style>
 </head>
 <body>
 <div class="wrap">
-  <div class="card">
-    <h3>任务 {{rid}} · 实时报告</h3>
-    <div id="box" style="min-height:260px"><pre id="log"></pre></div>
-    <div id="actions" style="display:none;">
-      <a class="btn" href="/report/{{rid}}">下载 Excel</a>
-      <a class="btn" href="/">返回首页</a>
-    </div>
+  <h1>任务 {{rid}} · 实时报告  <a class="btn" href="/resume/{{rid}}">继续（断点续跑）</a>  <a class="btn" href="/">返回</a></h1>
+  <div class="card"><pre id="log">连接已建立…</pre></div>
+  <div class="card" id="actions" style="margin-top:12px;display:none">
+    <a class="btn" id="dl" href="#">下载 Excel</a>
+    <a class="btn" id="rank" href="#">查看榜单</a>
   </div>
 </div>
 <script>
   const log = document.getElementById('log');
-  const evt = new EventSource("/stream/{{rid}}");
-  log.textContent += "连接已建立\\n\\n";
-  evt.onmessage = (e) => {
-    if(e.data === "[DONE]"){ evt.close(); document.getElementById('actions').style.display='block'; return; }
-    log.textContent += e.data + "\\n";
-    log.parentElement.scrollTop = log.parentElement.scrollHeight;
-  };
-  evt.onerror = () => { log.textContent += "\\n[!] 连接中断，稍后自动重试或刷新本页。\\n"; };
-</script>
-</body>
-</html>
-"""
+  const es = new EventSource('/stream/{{rid}}');
+  let done = false;
 
-# =========================
-# 工具函数：解析、LLM、打分
-# =========================
-
-EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}")
-
-def safe_mkdir(p: str):
-    os.makedirs(p, exist_ok=True)
-
-def sha1(s: str) -> str:
-    return hashlib.sha1(s.encode("utf-8", errors="ignore")).hexdigest()
-
-def extract_text_from_file(fullpath: str, data: bytes = None) -> str:
-    """从多种格式抽文本"""
-    name = fullpath.lower()
-    try:
-        if name.endswith(".pdf") and pdf_extract_text:
-            with open(fullpath, "rb") as f:
-                return pdf_extract_text(f)
-        elif name.endswith(".docx") and docx:
-            d = docx.Document(fullpath)
-            return "\n".join(p.text for p in d.paragraphs)
-        elif name.endswith((".html", ".htm")):
-            with open(fullpath, "rb") as f:
-                soup = BeautifulSoup(f, "lxml")
-                return soup.get_text(" ", strip=True)
-        elif name.endswith(".csv"):
-            with open(fullpath, "r", encoding="utf-8", errors="ignore") as f:
-                return "\n".join([",".join(row) for row in csv.reader(f)])
-        else:  # .txt 等
-            with open(fullpath, "r", encoding="utf-8", errors="ignore") as f:
-                return f.read()
-    except Exception as e:
-        return f"[PARSE_ERROR] {e}"
-
-def llm_json(prompt: str, temperature: float = 0.2, max_tokens: int = 800) -> Dict[str, Any]:
-    """
-    调用自定义大模型接口（兼容 OpenAI 格式）
-    返回 JSON（若模型返回文本，尽力解析 JSON）
-    """
-    url = f"{MODEL_BASE_URL}/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {MODEL_API_KEY}", "Content-Type":"application/json"}
-    body = {
-        "model": MODEL_NAME,
-        "messages": [{"role":"system","content":"你是资深猎头助手。回答请使用简洁中文。"},
-                     {"role":"user","content": prompt}],
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-        "response_format": {"type":"json_object"}
+  es.onmessage = (e)=>{
+    const t = e.data || '';
+    if (!t) return;
+    if (t.startsWith('[DONE]')) {
+      done = true; es.close();
+      document.getElementById('actions').style.display='block';
+      const rid = '{{rid}}';
+      document.getElementById('dl').href = '/report/'+rid;
+      document.getElementById('rank').href = '/top/'+rid;
+      return;
     }
-    try:
-        r = requests.post(url, headers=headers, data=json.dumps(body), timeout=120)
-        r.raise_for_status()
-        data = r.json()
-        content = data["choices"][0]["message"]["content"]
-        return json.loads(content)
-    except Exception as e:
-        return {"error": str(e)}
-
-def score_prompt(role: str, direction: str, must: str, nice: str, years: str, location: str, note: str, resume_text: str) -> str:
-    return f"""
-请阅读下方候选人简历内容，并基于【岗位要求】给出结构化判断，JSON 返回（严格键名）：
-- name（若无写“不详”）
-- current_company
-- current_title
-- email（若无写空字符串）
-- location
-- age_estimate（推断年龄，若不确定写“不详”，可按“本科入学 18 岁”推）
-- summary（100字内概述过往经历：年份-学校-专业-学历；年份-公司-职位-一句话职责）
-- risks（不超过3条，频繁跳槽/行业不匹配/关键经验缺失等）
-- tags（3~6个，逗号分隔）
-- grade（A+ / A / B / C，A+为非常匹配，A匹配，B一般，C不匹配）
-- remarks（200字内，用中文完整概述简历，便于电话沟通）
-
-【岗位名称】{role}
-【方向】{direction}
-【Must-have】{must}
-【Nice-to-have】{nice}
-【最低年限】{years}
-【地点/签证】{location}
-【补充说明/JD】{note}
-
-【候选人简历】
-{resume_text}
+    log.textContent += '\\n' + t;
+    log.scrollTop = log.scrollHeight;
+  };
+  es.onerror = ()=>{ if(!done) log.textContent += '\\n[!] 连接中断，可点击“继续”重试。'; };
+</script>
+</body></html>
 """
 
-def normalize_grade(g: str) -> str:
-    g = (g or "").strip().upper()
-    if g in ["A+", "A", "B", "C"]:
-        return g
-    # 容错：可能返回 "A plus"/"A++"
-    if "A+" in g or "PLUS" in g:
-        return "A+"
-    if g.startswith("A"): return "A"
-    if g.startswith("B"): return "B"
-    return "C"
+from flask import render_template_string
 
-def excel_export(rows: List[Dict[str, Any]], outpath: str):
-    """
-    导出 Excel，字段顺序：
-    名字、目前所在公司、目前职位、匹配等级、电话（工作/手机留空）、E-mail、年龄预估、目前所在地、
-    契合摘要、风险点、标签、Remarks
-    """
+app = Flask(__name__)
+
+# ----------------- 工具函数 -----------------
+def rid_now(role: str, direction: str) -> str:
+    base = role.strip()
+    if direction.strip():
+        base += "_" + direction.strip()
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe = re.sub(r"[^\u4e00-\u9fa5a-zA-Z0-9_\-]", "_", base)[:60]
+    return f"{safe}_{ts}"
+
+def push(q: Queue, msg: str):
+    try:
+        q.put_nowait(msg)
+    except Exception:
+        pass
+
+def norm_email(text: str) -> Optional[str]:
+    m = re.search(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", text)
+    return m.group(0).lower() if m else None
+
+def parse_html(html: str) -> Dict[str, Any]:
+    # 很轻量的抽取(避免依赖太重)，若你已有更稳的解析器可以替换
+    name = re.search(r"<title[^>]*>([^<]{2,40})</title>", html, re.I)
+    name = (name.group(1) if name else "").strip()
+    email = norm_email(html) or ""
+    company = ""
+    title = ""
+    # 尝试找“Company”/“公司”
+    mc = re.search(r"(?:Company|公司)[^:：]{0,8}[:：]\s*([^\n<]{2,50})", html, re.I)
+    if mc: company = mc.group(1).strip()
+    mt = re.search(r"(?:Title|职位)[^:：]{0,8}[:：]\s*([^\n<]{2,50})", html, re.I)
+    if mt: title = mt.group(1).strip()
+    return dict(name=name or "未命名", email=email, company=company, title=title)
+
+def parse_pdf(bytes_data: bytes) -> Dict[str, Any]:
+    # 尽量轻，避免 pdfminer 对 Render 的 CPU 压力；这里只提取 email + 简短姓名启发
+    text = ""
+    try:
+        from pdfminer.high_level import extract_text
+        text = extract_text(io.BytesIO(bytes_data)) or ""
+    except Exception:
+        pass
+    email = norm_email(text) or ""
+    name = ""
+    mn = re.search(r"([A-Za-z\u4e00-\u9fa5]{2,20})", text)
+    if mn: name = mn.group(1)
+    return dict(name=name or "未命名", email=email, company="", title="")
+
+def parse_docx(bytes_data: bytes) -> Dict[str, Any]:
+    text = ""
+    try:
+        import docx
+        f = io.BytesIO(bytes_data)
+        d = docx.Document(f)
+        text = "\n".join(p.text for p in d.paragraphs)
+    except Exception:
+        pass
+    email = norm_email(text) or ""
+    name = ""
+    mn = re.search(r"([A-Za-z\u4e00-\u9fa5]{2,20})", text)
+    if mn: name = mn.group(1)
+    return dict(name=name or "未命名", email=email, company="", title="")
+
+def parse_txt_csv(bytes_data: bytes) -> Dict[str, Any]:
+    text = bytes_data.decode("utf-8", "ignore")
+    email = norm_email(text) or ""
+    name = ""
+    mn = re.search(r"([A-Za-z\u4e00-\u9fa5]{2,20})", text)
+    if mn: name = mn.group(1)
+    return dict(name=name or "未命名", email=email, company="", title="")
+
+def excel_save(rows: List[Dict[str, Any]], path: str):
+    from openpyxl import Workbook
     wb = Workbook()
     ws = wb.active
     ws.title = "候选清单"
-
-    headers = [
-        "候选人名字","目前所在公司","目前职位","匹配等级（A+/A/B/C）",
-        "工作电话","手机","E-mail","年龄预估","目前所在地",
-        "契合摘要","风险点","标签","Remarks"
-    ]
-    ws.append(headers)
-
+    header = ["候选人名字","目前所在公司","目前职位","匹配等级","分数(0-100)","E-mail","年龄预估","目前所在地","契合摘要","风险点","标签","Remarks"]
+    ws.append(header)
     for r in rows:
         ws.append([
-            r.get("name","不详"),
-            r.get("current_company",""),
-            r.get("current_title",""),
-            r.get("grade",""),
-            "", "",  # 电话占位
-            r.get("email",""),
-            r.get("age_estimate","不详"),
-            r.get("location",""),
-            r.get("summary",""),
-            "；".join(r.get("risks", [])) if isinstance(r.get("risks"), list) else r.get("risks",""),
-            r.get("tags",""),
-            r.get("remarks",""),
+            r.get("name",""), r.get("company",""), r.get("title",""),
+            r.get("grade",""), r.get("score",0), r.get("email",""),
+            r.get("age",""), r.get("location",""), r.get("fit",""),
+            r.get("risk",""), r.get("tags",""), r.get("remarks",""),
         ])
-    wb.save(outpath)
+    wb.save(path)
 
-# =========================
-# 后端核心：处理任务
-# =========================
-
-def iter_all_files_from_upload(job_folder: str, files) -> List[str]:
-    """
-    保存上传，解压 zip，返回所有待解析文件绝对路径
-    """
-    save_dir = os.path.join(job_folder, "uploads")
-    safe_mkdir(save_dir)
-    total = 0
-    saved_paths: List[str] = []
-
-    # 限制总大小
-    for f in files:
-        total += len(f.read())
-        f.seek(0)
-    if total > MAX_UPLOAD_MB * 1024 * 1024:
-        raise ValueError(f"上传总大小超过限制：{MAX_UPLOAD_MB}MB")
-    # 保存 & 展开
-    for f in files:
-        filename = os.path.basename(f.filename)
-        if not filename:
-            continue
-        dst = os.path.join(save_dir, filename)
-        f.save(dst)
-        saved_paths.append(dst)
-
-        if filename.lower().endswith(".zip"):
-            with zipfile.ZipFile(dst, "r") as z:
-                for name in z.namelist():
-                    if name.endswith("/"):  # 跳过文件夹
-                        continue
-                    ext = os.path.splitext(name)[1].lower()
-                    if ext not in (".pdf", ".docx", ".txt", ".html", ".htm", ".csv"):
-                        continue
-                    data = z.read(name)
-                    out = os.path.join(save_dir, f"{uuid.uuid4().hex}{ext}")
-                    with open(out, "wb") as wf:
-                        wf.write(data)
-                    saved_paths.append(out)
-    # 过滤掉 zip 源文件
-    final_files = [p for p in saved_paths if not p.lower().endswith(".zip")]
-    return final_files
-
-def sse_put(q: Queue, msg: str):
-    try:
-        q.put_nowait(msg)
-    except:
-        pass
-
-def process_one_file(fullpath: str,
-                     params: Dict[str,str]) -> Optional[Dict[str, Any]]:
-    """
-    解析->LLM评分->返回结果字典
-    """
-    text = extract_text_from_file(fullpath)
-    if not text.strip():
-        return None
-    prompt = score_prompt(
-        role=params["role"],
-        direction=params.get("direction",""),
-        must=params.get("must",""),
-        nice=params.get("nice",""),
-        years=params.get("min_years",""),
-        location=params.get("location",""),
-        note=params.get("note",""),
-        resume_text=text[:120000]  # 防止超长
-    )
-    data = llm_json(prompt)
-    if "error" in data:
-        # 尝试再容错一次：有些模型会把 JSON 放在文本里
+def score_and_grade(candidate: Dict[str, Any], spec: Dict[str, Any]) -> (int, str, str):
+    # 非模型版的保底打分逻辑（你可以换为调用 DeepSeek 的函数；保持同样返回即可）
+    base = 60
+    textbag = " ".join([
+        candidate.get("name",""), candidate.get("title",""), candidate.get("company",""),
+        candidate.get("raw","")
+    ]).lower()
+    # must / nice
+    for k in spec.get("must", []):
+        if k and k.lower() in textbag: base += 12
+    for k in spec.get("nice", []):
+        if k and k.lower() in textbag: base += 5
+    # 年限 / 地域只是轻微调整（真实调用模型时可更精细）
+    if spec.get("min_years"):
         try:
-            data = json.loads(re.findall(r"\{[\\s\\S]*\}", str(data))[0])
-        except:
-            return {"name":"解析失败","current_company":"","current_title":"",
-                    "grade":"C","email":"","age_estimate":"不详","location":"",
-                    "summary":f"LLM 调用失败：{data['error']}","risks":[],"tags":"","remarks":""}
+            yrs = int(re.findall(r"\d+", spec["min_years"])[0])
+            base += min(10, yrs // 2)
+        except: pass
+    # clamp
+    score = max(0, min(100, base))
+    if score >= 90: grade = "A+"
+    elif score >= 80: grade = "A"
+    elif score >= 65: grade = "B"
+    else: grade = "C"
+    summary = f"{candidate.get('title','')} @ {candidate.get('company','')}".strip(" @")
+    risk = ""
+    tags = ",".join(spec.get("must", [])[:2])
+    # 备注示例
+    remarks = candidate.get("remarks","") or candidate.get("brief","") or ""
+    return score, grade, remarks or summary, risk, tags
 
-    # 归一化
-    data["grade"] = normalize_grade(data.get("grade",""))
-    # 邮箱兜底从文本匹配
-    if not data.get("email"):
-        m = EMAIL_RE.search(text)
-        data["email"] = m.group(0) if m else ""
-    return data
+# ----------------- 模型（可替换成 DeepSeek 调用） -----------------
+def call_model_summarize(text: str, jd: str) -> Dict[str, Any]:
+    """
+    如果你要接入 DeepSeek/OpenAI，就在这里实现调用并返回：
+    {"education":"…","timeline":[{"from":"2018","to":"2021","company":"…","role":"…","one":"…"}]}
+    这里给一个安全兜底：用规则生成“Remarks”即可。
+    """
+    # 简易规则生成
+    lines = []
+    # 教育
+    edu = re.findall(r"(20\d{2}|19\d{2}).{0,20}(大学|学院|硕士|博士|本科)", text)
+    if edu:
+        years = sorted(set(y for y,_ in edu))
+        lines.append("教育经历：" + "；".join(sorted(years)) + "（推断）")
+    # 时间线
+    rolls = re.findall(r"(20\d{2}|19\d{2}).{0,5}[-–~到至].{0,5}(20\d{2}|至今|现在).{0,20}([^\n，。,;]{2,40})", text)
+    for a,b,c in rolls[:4]:
+        lines.append(f"{a}–{b}：{c}")
+    return {"remarks":"；".join(lines[:6])}
 
-def dedupe_rows(rows: List[Dict[str,Any]]) -> List[Dict[str,Any]]:
-    """
-    去重优先级：email > name+company
-    """
-    seen_email, seen_pair = set(), set()
-    out = []
-    for r in rows:
-        key_email = (r.get("email","") or "").lower().strip()
-        key_pair  = ( (r.get("name","") or "").strip(), (r.get("current_company","") or "").strip() )
-        if key_email:
-            if key_email in seen_email: 
-                continue
-            seen_email.add(key_email)
+# ----------------- 任务执行 -----------------
+def worker_run(rid: str, spec: Dict[str, Any]):
+    job = JOBS[rid]; q: Queue = job["q"]
+    folder = job["folder"]
+    push(q, "▶ 开始处理…")
+    uploads_dir = os.path.join(folder, "uploads")
+    out_xlsx = os.path.join(folder, "result.xlsx")
+    os.makedirs(uploads_dir, exist_ok=True)
+
+    # 聚合候选
+    candidates: List[Dict[str, Any]] = []
+
+    # 解压 & 逐文件解析
+    for fn in os.listdir(uploads_dir):
+        fpath = os.path.join(uploads_dir, fn)
+        push(q, f"• 解析 {fn} …")
+        try:
+            with open(fpath, "rb") as f:
+                data = f.read()
+            if fn.lower().endswith(".zip"):
+                with zipfile.ZipFile(io.BytesIO(data)) as z:
+                    for n in z.namelist():
+                        if n.endswith("/"): continue
+                        raw = z.read(n)
+                        cand = parse_any_by_name(n, raw)
+                        cand["raw"] = (raw[:5000]).decode("utf-8","ignore") if isinstance(raw, bytes) else str(raw)[:5000]
+                        candidates.append(cand)
+            else:
+                cand = parse_any_by_name(fn, data)
+                cand["raw"] = data.decode("utf-8","ignore")[:5000] if isinstance(data, bytes) else str(data)[:5000]
+                candidates.append(cand)
+        except Exception as e:
+            push(q, f"[!] 解析 {fn} 失败：{e}")
+
+    if not candidates:
+        push(q, "[!] 未解析到任何候选，请确认上传包是否包含 PDF/HTML/DOCX/TXT/CSV。")
+        push(q, "[DONE]"); job["status"]="done"; return
+
+    # 去重（优先 email）
+    dedup: Dict[str, Dict[str, Any]] = {}
+    for c in candidates:
+        key = c.get("email") or (c.get("name","") + "|" + c.get("company",""))
+        if key in dedup:
+            old = dedup[key]
+            # 合并信息
+            for k in ("title","company"):
+                if len((c.get(k) or "")) > len(old.get(k) or ""):
+                    old[k] = c.get(k)
         else:
-            if key_pair in seen_pair:
-                continue
-            seen_pair.add(key_pair)
-        out.append(r)
-    return out
+            dedup[key] = c
+    candidates = list(dedup.values())
+    push(q, f"• 去重后候选：{len(candidates)}")
 
-def run_job(rid: str):
-    """
-    后台线程：跑并发，SSE 实时写入
-    """
-    job = JOBS[rid]
-    q: Queue = job["q"]
-    params = job["params"]
-    files  = job["files"]
-    sse_put(q, f"任务开始，共 {len(files)} 份文件")
+    # 模型/规则 生成 remarks + 打分分级
+    rows = []
+    for i,c in enumerate(candidates,1):
+        if i % 8 == 0: push(q, f"  进度：{i}/{len(candidates)}")
+        # 生成备注
+        try:
+            info = call_model_summarize(c.get("raw",""), spec.get("note",""))
+            if info and "remarks" in info: c["remarks"] = info["remarks"]
+        except Exception:
+            pass
+        score, grade, summary, risk, tags = score_and_grade(c, spec)
+        rows.append({
+            "name": c.get("name",""),
+            "company": c.get("company",""),
+            "title": c.get("title",""),
+            "grade": grade,
+            "score": score,
+            "email": c.get("email",""),
+            "age": "",  # 你有需要再加推断
+            "location": spec.get("location",""),
+            "fit": summary,
+            "risk": risk,
+            "tags": tags,
+            "remarks": c.get("remarks",""),
+        })
 
-    rows: List[Dict[str,Any]] = []
-    ok, fail = 0, 0
+    # 排序：分数 → A+ 优先
+    rows.sort(key=lambda r: (r["grade"]!="A+", -r["score"]), reverse=False)
+    excel_save(rows, out_xlsx)
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        fut2file = {ex.submit(process_one_file, f, params): f for f in files}
-        for fut in as_completed(fut2file):
-            f = fut2file[fut]
-            name = os.path.basename(f)
-            try:
-                res = fut.result()
-                if res:
-                    rows.append(res)
-                    ok += 1
-                    sse_put(q, f"[{ok}/{len(files)}] 完成：{name} · 评分 {res.get('grade','')}")
-                else:
-                    fail += 1
-                    sse_put(q, f"[!] 解析失败：{name}")
-            except Exception as e:
-                fail += 1
-                sse_put(q, f"[!] 处理异常：{name} · {e}")
+    job["status"]="done"
+    job["result"] = rows
+    push(q, f"✅ 完成，共 {len(rows)} 人。")
+    push(q, "[DONE]")
 
-    sse_put(q, "去重与排序中…")
-    rows = dedupe_rows(rows)
-    # 排序：A+ > A > B > C
-    rank = {"A+":0, "A":1, "B":2, "C":3}
-    rows.sort(key=lambda r: rank.get(r.get("grade","C"), 9))
+def parse_any_by_name(name: str, data: bytes) -> Dict[str, Any]:
+    low = name.lower()
+    if low.endswith(".pdf"): return parse_pdf(data)
+    if low.endswith(".docx"): return parse_docx(data)
+    if low.endswith(".html") or low.endswith(".htm"):
+        return parse_html(data.decode("utf-8","ignore"))
+    if low.endswith(".txt") or low.endswith(".csv"):
+        return parse_txt_csv(data)
+    # 兜底尝试 html/txt
+    try:
+        txt = data.decode("utf-8","ignore")
+        if "<html" in txt.lower(): return parse_html(txt)
+        else: return parse_txt_csv(data)
+    except Exception:
+        return {"name":"未命名","email":"","company":"","title":""}
 
-    out_xlsx = os.path.join(job["folder"], "候选清单.xlsx")
-    excel_export(rows, out_xlsx)
-
-    job["results"] = {"total":len(files), "ok":ok, "fail":fail, "xlsx": out_xlsx}
-    job["done"] = True
-
-    sse_put(q, f"完成：共 {len(files)} 份，成功 {ok}，失败 {fail}。")
-    sse_put(q, "[DONE]")
-
-# =========================
-# 路由
-# =========================
-
+# ----------------- 路由 -----------------
 @app.get("/")
 def index():
-    jobs_sorted = sorted(
-        [(rid, {"name": info["name"], "created": info["created"]})
-         for rid, info in JOBS.items()],
-        key=lambda x: x[1]["created"],
-        reverse=True,
-    )
-    return render_template_string(INDEX_HTML, jobs=jobs_sorted)
+    jobs = sorted([(rid,info) for rid,info in JOBS.items()], key=lambda x: x[1]["created"], reverse=True)[:20]
+    return render_template_string(INDEX_HTML, jobs=jobs)
 
 @app.post("/process")
 def process():
-    # —— 表单取值（键名与前端一致）——
-    role       = request.form.get("role","").strip()
+    # 校验职位名称
+    role = (request.form.get("role") or "").strip()
     if not role:
-        return Response("职位名称必填", status=400)
-    direction  = request.form.get("direction","").strip()
-    min_years  = request.form.get("min_years","").strip()
-    location   = request.form.get("location","").strip()
-    must       = request.form.get("must","").strip()
-    nice       = request.form.get("nice","").strip()
-    note       = request.form.get("note","").strip()
-    files      = request.files.getlist("files")
+        return "职位名称必填", 400
 
-    if not files or all(not f.filename for f in files):
-        return Response("请至少上传 1 个文件", status=400)
+    direction = (request.form.get("direction") or "").strip()
+    rid = rid_now(role, direction)
+    folder = os.path.join(WORK_DIR, rid)
+    os.makedirs(folder, exist_ok=True)
+    uploads = os.path.join(folder, "uploads")
+    os.makedirs(uploads, exist_ok=True)
 
-    # —— 任务命名：职位_方向_时间戳 —— 
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    jobname = f"{role}_{direction}_{ts}".replace("/", "_").replace("\\", "_").replace(" ", "_")
-    folder  = os.path.join(DATA_DIR, jobname)
-    safe_mkdir(folder)
+    # 文件落地
+    total = 0
+    fs = request.files.getlist("files")
+    for f in fs:
+        b = f.read()
+        total += len(b)
+        if total > MAX_UPLOAD_MB*1024*1024:
+            return f"上传超出 {MAX_UPLOAD_MB}MB 限制", 400
+        with open(os.path.join(uploads, f.filename), "wb") as out:
+            out.write(b)
 
-    try:
-        all_files = iter_all_files_from_upload(folder, files)
-    except Exception as e:
-        return Response(f"上传/解压失败：{e}", status=400)
-
-    rid = uuid.uuid4().hex[:8]
+    # 建任务
     q = Queue()
     JOBS[rid] = {
         "q": q,
         "created": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "name": jobname,
+        "name": rid,
         "folder": folder,
-        "files": all_files,
-        "results": None,
-        "done": False,
-        "params": {
-            "role": role, "direction": direction, "min_years": min_years,
-            "location": location, "must": must, "nice": nice, "note": note
-        }
+        "status": "running",
+        "last": time.time(),
     }
-
-    # 后台跑
-    from threading import Thread
-    t = Thread(target=run_job, args=(rid,), daemon=True)
-    t.start()
-    return redirect(url_for("events", rid=rid))
+    spec = dict(
+        role=role,
+        direction=direction,
+        min_years=(request.form.get("min_years") or "").strip(),
+        location=(request.form.get("location") or "").strip(),
+        must=[x.strip() for x in (request.form.get("must") or "").split(",") if x.strip()],
+        nice=[x.strip() for x in (request.form.get("nice") or "").split(",") if x.strip()],
+        note=(request.form.get("note") or "").strip(),
+    )
+    Thread(target=worker_run, args=(rid, spec), daemon=True).start()
+    return redirect(f"/events/{rid}")
 
 @app.get("/events/<rid>")
-def events(rid: str):
-    if rid not in JOBS:
-        return Response("任务不存在", status=404)
+def events_page(rid):
+    if rid not in JOBS: return "任务不存在", 404
     return render_template_string(EVENTS_HTML, rid=rid)
 
 @app.get("/stream/<rid>")
-def stream(rid: str):
-    if rid not in JOBS:
-        return Response("任务不存在", status=404)
-    job = JOBS[rid]
-    q: Queue = job["q"]
+def stream(rid):
+    if rid not in JOBS: return "data: 任务不存在\n\n", 200, {"Content-Type":"text/event-stream"}
+    q: Queue = JOBS[rid]["q"]
 
     def gen():
-        yield "data: ▶ 连接已建立\\n\\n"
+        yield "data: 连接已建立\n\n"
+        hb = 0
         while True:
-            msg = q.get()
-            if msg == "[DONE]":
-                yield "data: [DONE]\\n\\n"
-                break
-            safe = str(msg).replace("\\r"," ").replace("\\n","\\n")
-            yield f"data: {safe}\\n\\n"
-
-    headers = {
+            try:
+                msg = q.get(timeout=2)
+                if msg == "[DONE]":
+                    yield "data: [DONE]\n\n"; break
+                safe = str(msg).replace("\r"," ").replace("\n","\\n")
+                yield f"data: {safe}\n\n"
+            except QEmpty:
+                # 心跳：Render 免费版防休眠
+                hb += 1
+                if hb >= 6:   # 每 ~12 秒
+                    hb = 0
+                    yield "data: …\n\n"
+    return Response(gen(), headers={
         "Content-Type":"text/event-stream",
         "Cache-Control":"no-cache",
         "X-Accel-Buffering":"no",
-        "Connection":"keep-alive"
-    }
-    return Response(gen(), headers=headers)
+        "Connection":"keep-alive",
+    })
 
 @app.get("/report/<rid>")
-def report(rid: str):
-    if rid not in JOBS:
-        return Response("任务不存在", status=404)
+def report(rid):
+    if rid not in JOBS: return "任务不存在", 404
+    path = os.path.join(JOBS[rid]["folder"], "result.xlsx")
+    if not os.path.exists(path): return "报告未生成", 404
+    return send_file(path, as_attachment=True, download_name=f"{rid}.xlsx")
+
+@app.get("/top/<rid>")
+def top(rid):
+    if rid not in JOBS: return "任务不存在", 404
+    rows = JOBS[rid].get("result") or []
+    html = ["<html><meta charset='utf-8'><body style='background:#0b0f14;color:#e3e8f2;font-family:ui-sans-serif'>",
+            f"<h2>榜单 · {rid}</h2><ol>"]
+    for r in rows[:50]:
+        html.append(f"<li>{r.get('grade')} · {r.get('score')} · {r.get('name')} — {r.get('title','')} @ {r.get('company','')} · {r.get('email','')}</li>")
+    html.append("</ol><a href='/'>返回</a></body></html>")
+    return "\n".join(html)
+
+@app.get("/resume/<rid>")
+def resume(rid):
+    if rid not in JOBS: return redirect("/")
     job = JOBS[rid]
-    if not job.get("done"):
-        return Response("任务尚未完成", status=400)
-    xlsx = job["results"]["xlsx"]
-    return send_file(xlsx, as_attachment=True, download_name=os.path.basename(xlsx))
+    if job.get("status") == "done":
+        return redirect(f"/events/{rid}")
+    # 简单的“继续”：往队列塞一个提示，线程仍在跑；若线程已挂可在此重启（此处保守不自动拉起，避免重复）
+    push(job["q"], "↻ 若上次中断，请稍等，任务会继续输出…")
+    return redirect(f"/events/{rid}")
 
-# 健康检查
+# ----------------- 健康检查 -----------------
 @app.get("/healthz")
-def healthz():
-    return {"ok": True, "workers": MAX_WORKERS, "model": MODEL_NAME}
+def health():
+    return {"ok": True, "ts": time.time()}
 
-# =========================
-# 本地启动
-# =========================
 if __name__ == "__main__":
-    # 本地调试：python app.py
-    port = int(os.getenv("PORT", "5000"))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")), debug=False)
