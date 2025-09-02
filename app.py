@@ -60,88 +60,134 @@ JOBS: Dict[str, Dict[str, Any]] = {}
 ALLOWED_EXTS = (".pdf", ".docx", ".doc", ".html", ".htm", ".txt")
 
 # ----------------- HTML 模板 -----------------
-INDEX_HTML = """
+
+INDEX_HTML = r"""
 <!doctype html>
-<html lang="zh">
+<html lang="zh-CN">
 <head>
-<meta charset="utf-8"/>
-<title>linkedin-批量简历分析</title>
-<meta name="viewport" content="width=device-width,initial-scale=1"/>
-<link rel="icon" href="data:,">
-<style>
-  body{background:#0b0f14;color:#dfe7ef;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial}
-  .wrap{max-width:980px;margin:32px auto;padding:0 16px}
-  h1{font-size:24px;margin:0 0 8px}
-  small{color:#8aa1b2}
-  .card{background:#0f1520;border:1px solid #1d2a39;border-radius:14px;padding:18px;margin:16px 0}
-  label{display:block;margin:8px 0 6px}
-  input[type=text],input[type=number]{width:100%;padding:10px;border-radius:10px;border:1px solid #2a3a4a;background:#0b121a;color:#e9f1f8}
-  input[type=file]{margin:8px 0}
-  .row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
-  .btn{display:inline-block;background:#2563eb;color:#fff;padding:10px 16px;border-radius:10px;border:none;cursor:pointer}
-  .btn:disabled{opacity:.6;cursor:not-allowed}
-  .muted{color:#8aa1b2}
-  a{color:#93c5fd;text-decoration:none}
-</style>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>linkedin-批量简历分析</title>
+  <style>
+    :root{color-scheme:dark;}
+    body{margin:0;font:14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Inter,Helvetica,Arial,"PingFang SC","Hiragino Sans GB","Microsoft YaHei","Noto Sans CJK SC",sans-serif;background:#0b1220;color:#e6edf3}
+    .wrap{max-width:980px;margin:40px auto;padding:0 16px}
+    .card{background:#0f172a;border:1px solid #25304a;border-radius:14px;padding:20px}
+    h1{font-size:26px;margin:0 0 14px}
+    h2{font-size:16px;margin:22px 0 10px;color:#9fb4d5}
+    label{display:block;margin:12px 0 6px;color:#bfd3f3}
+    input[type=text],input[type=number],input[type=password]{width:100%;padding:10px 12px;border:1px solid #2b3a57;background:#0b1220;border-radius:10px;color:#e6edf3;outline:none}
+    input[type=file]{width:100%}
+    .row{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+    .muted{color:#8aa2c9;font-size:13px}
+    .danger{color:#ffb4b4}
+    .btn{display:inline-flex;gap:8px;align-items:center;background:#2563eb;border:0;color:#fff;padding:12px 16px;border-radius:12px;cursor:pointer;font-weight:600}
+    .btn:disabled{opacity:.6;cursor:not-allowed}
+    .btn.secondary{background:#1f2937}
+    .pill{display:inline-block;border:1px solid #2b3a57;border-radius:999px;padding:2px 8px;color:#9fb4d5;font-size:12px}
+    .tip{background:#0b132e;border-left:3px solid #3b82f6;padding:10px 12px;border-radius:8px;color:#a8c1ee}
+    .grid-3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px}
+    .switch{display:flex;align-items:center;gap:8px}
+    .switch input{width:20px;height:20px}
+    .hr{height:1px;background:#1d2640;margin:18px 0}
+  </style>
 </head>
 <body>
-<div class="wrap">
-  <h1>linkedin-批量简历分析</h1>
-  <p class="muted">支持上传 PDF/DOCX/HTML/TXT（可打包 ZIP），后台并发解析并实时输出。</p>
+  <div class="wrap">
+    <h1>linkedin-批量简历分析 <span class="pill">支持 PDF / DOCX / HTML / TXT（可打包 ZIP）</span></h1>
+    <p class="muted">上传职位 JD（可选）与候选人简历（可多选/可ZIP），后端并发解析并<strong>实时流式</strong>输出。完成后可下载 Excel 清单。</p>
 
-  <form class="card" action="/process" method="post" enctype="multipart/form-data">
-    <div class="row">
-      <div>
-        <label>职位名称（必填）</label>
-        <input type="text" name="job_title" placeholder="如：资深基础设施架构师" required>
+    <form id="form" class="card" action="/process" method="post" enctype="multipart/form-data">
+      <!-- 基本信息 -->
+      <h2>职位信息</h2>
+      <div class="row">
+        <div>
+          <label>职位名称（必填）</label>
+          <input required type="text" name="title" placeholder="如：资深基础设施架构师" />
+        </div>
+        <div>
+          <label>方向（可选）</label>
+          <input type="text" name="direction" placeholder="如：Infra / SRE / 医疗IT" />
+        </div>
       </div>
-      <div>
-        <label>方向（选填）</label>
-        <input type="text" name="job_track" placeholder="如：Infra / SRE / 医疗IT">
+
+      <!-- JD 上传 -->
+      <h2>职位 JD（可选）</h2>
+      <label>上传 JD 文件（PDF/DOCX/TXT/HTML，单个）</label>
+      <input type="file" name="jd_file" accept=".pdf,.doc,.docx,.txt,.html,.htm" />
+
+      <div class="hr"></div>
+
+      <!-- 模型配置 -->
+      <h2>模型与并发</h2>
+      <div class="grid-3">
+        <div>
+          <label>模型名称（默认 deepseek-chat）</label>
+          <input type="text" name="model_name" id="model_name" placeholder="deepseek-chat" />
+        </div>
+        <div>
+          <label>每批次并发（默认 2）</label>
+          <input type="number" name="concurrency" id="concurrency" min="1" max="8" step="1" placeholder="2" />
+        </div>
+        <div class="switch" style="margin-top:34px">
+          <input type="checkbox" id="stream" name="stream" checked />
+          <label for="stream" style="margin:0">实时流式输出（建议开启）</label>
+        </div>
       </div>
-    </div>
 
-    <div class="row">
-      <div>
-        <label>模型名称（默认 {{def_model}}）</label>
-        <input type="text" name="model_name" value="{{def_model}}">
+      <div class="row">
+        <div>
+          <label>模型 Base URL（默认从环境变量）</label>
+          <input type="text" name="base_url" id="base_url" placeholder="https://api.deepseek.com/v1" />
+        </div>
+        <div>
+          <label>模型 API Key（默认从环境变量）</label>
+          <input type="password" name="api_key" id="api_key" placeholder="sk-********" />
+        </div>
       </div>
-      <div>
-        <label>每批次并发（默认 {{def_cc}}）</label>
-        <input type="number" min="1" max="10" name="concurrency" value="{{def_cc}}">
+
+      <div class="tip" style="margin-top:8px">
+        免费实例若长期空闲会休眠，首次请求会较慢。若上传体积较大，建议分包（如 20～30 份/包）。<br/>
+        Base URL 建议以 <code>/v1</code> 结尾；模型名称如 <code>deepseek-chat</code>。表单中填写的值会覆盖环境变量，仅对本次任务生效。
       </div>
-    </div>
 
-    <div class="row">
-      <div>
-        <label>模型 Base URL（默认从环境变量）</label>
-        <input type="text" name="model_base" value="{{def_base}}">
+      <div class="hr"></div>
+
+      <!-- 简历上传 -->
+      <h2>候选人简历</h2>
+      <label>上传文件（可多选或 ZIP 打包；支持 .pdf .docx .doc .html .htm .txt .zip）</label>
+      <input required type="file" name="files" id="files" multiple
+             accept=".pdf,.doc,.docx,.txt,.html,.htm,.zip" />
+
+      <p class="muted" style="margin-top:6px">
+        将自动按：<strong>职位名称_方向_时间戳</strong> 创建任务和报告文件夹；若未填写方向则省略该段。中断可在“实时报告”页点击“继续”接着跑。
+      </p>
+
+      <div style="margin-top:16px;display:flex;gap:10px">
+        <button class="btn" type="submit">开始分析（生成Excel清单）</button>
+        <a class="btn secondary" href="/reports" title="查看历史任务并下载报告">查看历史报告</a>
       </div>
-      <div>
-        <label>模型 API Key（默认从环境变量）</label>
-        <input type="text" name="model_key" value="{{def_key}}">
-      </div>
-    </div>
-
-    <label>上传文件（单个或 ZIP；可多选）</label>
-    <input type="file" name="files" multiple required>
-
-    <p class="muted">注意：免费实例若长期空闲会休眠，首次请求会较慢。若上传体积较大，建议分包（如 20~30 份/包）。</p>
-
-    <button class="btn" type="submit">开始分析（生成Excel清单）</button>
-  </form>
-
-  {% if jobs %}
-  <div class="card">
-    <h3>历史任务</h3>
-    <ul>
-     {% for rid, info in jobs %}
-       <li><a href="/events/{{rid}}">继续 / 查看：{{info['name']}}</a>（{{info['created']}}）</li>
-     {% endfor %}
-    </ul>
+    </form>
   </div>
-  {% endif %}
-</div>
+
+  <script>
+    // 将环境变量默认值（如后端注入）回填到表单
+    // 如果后端没注入，这段也不会报错
+    try {
+      fetch('/env-defaults').then(r => r.json()).then(d => {
+        if(d && typeof d === 'object'){
+          if(d.MODEL_NAME && !document.getElementById('model_name').value)
+            document.getElementById('model_name').value = d.MODEL_NAME;
+          if(d.CONCURRENCY && !document.getElementById('concurrency').value)
+            document.getElementById('concurrency').value = d.CONCURRENCY;
+          if(d.MODEL_BASE_URL && !document.getElementById('base_url').value)
+            document.getElementById('base_url').value = d.MODEL_BASE_URL;
+          if(d.MODEL_API_KEY && !document.getElementById('api_key').value)
+            document.getElementById('api_key').value = d.MODEL_API_KEY;
+        }
+      }).catch(()=>{});
+    } catch(e){}
+  </script>
 </body>
 </html>
 """
