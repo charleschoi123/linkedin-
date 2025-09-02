@@ -61,136 +61,57 @@ ALLOWED_EXTS = (".pdf", ".docx", ".doc", ".html", ".htm", ".txt")
 
 # ----------------- HTML 模板 -----------------
 
-INDEX_HTML = r"""
-<!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>linkedin-批量简历分析</title>
-  <style>
-    :root{color-scheme:dark;}
-    body{margin:0;font:14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Inter,Helvetica,Arial,"PingFang SC","Hiragino Sans GB","Microsoft YaHei","Noto Sans CJK SC",sans-serif;background:#0b1220;color:#e6edf3}
-    .wrap{max-width:980px;margin:40px auto;padding:0 16px}
-    .card{background:#0f172a;border:1px solid #25304a;border-radius:14px;padding:20px}
-    h1{font-size:26px;margin:0 0 14px}
-    h2{font-size:16px;margin:22px 0 10px;color:#9fb4d5}
-    label{display:block;margin:12px 0 6px;color:#bfd3f3}
-    input[type=text],input[type=number],input[type=password]{width:100%;padding:10px 12px;border:1px solid #2b3a57;background:#0b1220;border-radius:10px;color:#e6edf3;outline:none}
-    input[type=file]{width:100%}
-    .row{display:grid;grid-template-columns:1fr 1fr;gap:16px}
-    .muted{color:#8aa2c9;font-size:13px}
-    .danger{color:#ffb4b4}
-    .btn{display:inline-flex;gap:8px;align-items:center;background:#2563eb;border:0;color:#fff;padding:12px 16px;border-radius:12px;cursor:pointer;font-weight:600}
-    .btn:disabled{opacity:.6;cursor:not-allowed}
-    .btn.secondary{background:#1f2937}
-    .pill{display:inline-block;border:1px solid #2b3a57;border-radius:999px;padding:2px 8px;color:#9fb4d5;font-size:12px}
-    .tip{background:#0b132e;border-left:3px solid #3b82f6;padding:10px 12px;border-radius:8px;color:#a8c1ee}
-    .grid-3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px}
-    .switch{display:flex;align-items:center;gap:8px}
-    .switch input{width:20px;height:20px}
-    .hr{height:1px;background:#1d2640;margin:18px 0}
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    <h1>linkedin-批量简历分析 <span class="pill">支持 PDF / DOCX / HTML / TXT（可打包 ZIP）</span></h1>
-    <p class="muted">上传职位 JD（可选）与候选人简历（可多选/可ZIP），后端并发解析并<strong>实时流式</strong>输出。完成后可下载 Excel 清单。</p>
-
-    <form id="form" class="card" action="/process" method="post" enctype="multipart/form-data">
-      <!-- 基本信息 -->
-      <h2>职位信息</h2>
+INDEX_HTML = """<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Alsos Talent · 合规AI自动化寻访（MVP）</title>
+<style>
+ body { font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial;margin:0;background:#0b0f14;color:#e3e8f2;}
+ .wrap { max-width: 980px; margin: 32px auto; padding: 0 16px; }
+ h1 { font-size: 22px; margin: 12px 0 18px; }
+ .card { background:#121824; border:1px solid #1e2633; border-radius:16px; padding:20px; margin-bottom:18px; }
+ label { display:block; font-size:14px; color:#A9B4C6; margin:8px 0 6px; }
+ input[type="text"], textarea { width:100%; background:#0b1018; color:#dbe4f0; border:1px solid #223044; border-radius:10px; padding:10px 12px; outline:none; }
+ textarea { min-height: 110px; }
+ .row { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
+ .btn { background:#2563eb; color:white; border:none; padding:12px 16px; border-radius:12px; cursor:pointer; font-weight:600; }
+ small { color:#93a1b7; } .muted { color:#93a1b7; font-size:12px; } .pill { display:inline-block; padding:2px 8px; background:#102033; border:1px solid #223044; border-radius:999px; margin-right:6px; font-size:12px; color:#B8C4D9;}
+ a{ color:#7aa0ff; text-decoration:none;}
+ table{width:100%; border-collapse:collapse;}
+ th,td{border-bottom:1px solid #1f2b3d; padding:8px 6px; text-align:left; vertical-align:top; font-size:13px;}
+</style></head><body><div class="wrap">
+  <h1>Alsos Talent · 合规AI自动化寻访（MVP）</h1>
+  <div class="card"><p class="muted">说明：本工具<strong>不做</strong>对 LinkedIn/猎聘 的自动点开或抓取；仅对你<strong>合规导出</strong>的 ZIP/PDF/HTML/CSV/文本做AI分析、排序并导出Excel。</p></div>
+  <form action="/process" method="post" enctype="multipart/form-data">
+    <div class="card"><h3>上传候选集（支持多文件）</h3>
+      <label>选择文件（.zip .pdf .html/.htm .docx .txt .csv）：</label>
+      <input type="file" name="files" multiple required />
+      <small>可直接上传 Recruiter Lite 25人/包的 ZIP（一次多包）。</small>
+    </div>
+    <div class="card"><h3>岗位/筛选要求</h3>
       <div class="row">
-        <div>
-          <label>职位名称（必填）</label>
-          <input required type="text" name="title" placeholder="如：资深基础设施架构师" />
-        </div>
-        <div>
-          <label>方向（可选）</label>
-          <input type="text" name="direction" placeholder="如：Infra / SRE / 医疗IT" />
-        </div>
+        <div><label>职位名称 / 方向</label><input type="text" name="role" placeholder="例如：云原生/平台架构负责人"/></div>
+        <div><label>最低年限</label><input type="text" name="min_years" placeholder="例如：8 或 10-15"/></div>
       </div>
-
-      <!-- JD 上传 -->
-      <h2>职位 JD（可选）</h2>
-      <label>上传 JD 文件（PDF/DOCX/TXT/HTML，单个）</label>
-      <input type="file" name="jd_file" accept=".pdf,.doc,.docx,.txt,.html,.htm" />
-
-      <div class="hr"></div>
-
-      <!-- 模型配置 -->
-      <h2>模型与并发</h2>
-      <div class="grid-3">
-        <div>
-          <label>模型名称（默认 deepseek-chat）</label>
-          <input type="text" name="model_name" id="model_name" placeholder="deepseek-chat" />
-        </div>
-        <div>
-          <label>每批次并发（默认 2）</label>
-          <input type="number" name="concurrency" id="concurrency" min="1" max="8" step="1" placeholder="2" />
-        </div>
-        <div class="switch" style="margin-top:34px">
-          <input type="checkbox" id="stream" name="stream" checked />
-          <label for="stream" style="margin:0">实时流式输出（建议开启）</label>
-        </div>
-      </div>
-
       <div class="row">
-        <div>
-          <label>模型 Base URL（默认从环境变量）</label>
-          <input type="text" name="base_url" id="base_url" placeholder="https://api.deepseek.com/v1" />
-        </div>
-        <div>
-          <label>模型 API Key（默认从环境变量）</label>
-          <input type="password" name="api_key" id="api_key" placeholder="sk-********" />
-        </div>
+        <div><label>Must-have关键词（逗号分隔）</label><input type="text" name="must" placeholder="例如：K8s, DevOps, 安全合规"/></div>
+        <div><label>Nice-to-have关键词（逗号分隔）</label><input type="text" name="nice" placeholder="例如：HPC, 监管合规, 金融行业"/></div>
       </div>
-
-      <div class="tip" style="margin-top:8px">
-        免费实例若长期空闲会休眠，首次请求会较慢。若上传体积较大，建议分包（如 20～30 份/包）。<br/>
-        Base URL 建议以 <code>/v1</code> 结尾；模型名称如 <code>deepseek-chat</code>。表单中填写的值会覆盖环境变量，仅对本次任务生效。
+      <div class="row">
+        <div><label>学历/学校偏好（选填）</label><input type="text" name="edu" placeholder="例如：硕士/博士优先；985/211"/></div>
+        <div><label>地域/签证等限制（选填）</label><input type="text" name="location" placeholder="例如：上海/苏州；可出差；英文流利"/></div>
       </div>
-
-      <div class="hr"></div>
-
-      <!-- 简历上传 -->
-      <h2>候选人简历</h2>
-      <label>上传文件（可多选或 ZIP 打包；支持 .pdf .docx .doc .html .htm .txt .zip）</label>
-      <input required type="file" name="files" id="files" multiple
-             accept=".pdf,.doc,.docx,.txt,.html,.htm,.zip" />
-
-      <p class="muted" style="margin-top:6px">
-        将自动按：<strong>职位名称_方向_时间戳</strong> 创建任务和报告文件夹；若未填写方向则省略该段。中断可在“实时报告”页点击“继续”接着跑。
-      </p>
-
-      <div style="margin-top:16px;display:flex;gap:10px">
-        <button class="btn" type="submit">开始分析（生成Excel清单）</button>
-        <a class="btn secondary" href="/reports" title="查看历史任务并下载报告">查看历史报告</a>
+      <label>补充说明（用于指导AI评估）</label><textarea name="note" placeholder="例如：优先有从0→1平台建设经验；避免频繁跳槽。"></textarea>
+    </div>
+    <div class="card"><h3>模型与并发</h3>
+      <div class="row">
+        <div><label>模型名称 <small>(默认 {{model_name}})</small></label><input type="text" name="model_name" value="{{model_name}}"/></div>
+        <div><label>每批次并发 <small>(默认 {{max_workers}})</small></label><input type="text" name="workers" value="{{max_workers}}"/></div>
       </div>
-    </form>
-  </div>
-
-  <script>
-    // 将环境变量默认值（如后端注入）回填到表单
-    // 如果后端没注入，这段也不会报错
-    try {
-      fetch('/env-defaults').then(r => r.json()).then(d => {
-        if(d && typeof d === 'object'){
-          if(d.MODEL_NAME && !document.getElementById('model_name').value)
-            document.getElementById('model_name').value = d.MODEL_NAME;
-          if(d.CONCURRENCY && !document.getElementById('concurrency').value)
-            document.getElementById('concurrency').value = d.CONCURRENCY;
-          if(d.MODEL_BASE_URL && !document.getElementById('base_url').value)
-            document.getElementById('base_url').value = d.MODEL_BASE_URL;
-          if(d.MODEL_API_KEY && !document.getElementById('api_key').value)
-            document.getElementById('api_key').value = d.MODEL_API_KEY;
-        }
-      }).catch(()=>{});
-    } catch(e){}
-  </script>
-</body>
-</html>
-"""
+      <small>Render 环境变量需配置：MODEL_API_KEY / MODEL_BASE_URL / MODEL_NAME。</small>
+    </div>
+    <div class="card"><button class="btn" type="submit">开始分析（生成Excel清单）</button>
+      <small>提交后会跳到“实时报告”页面，边分析边输出。</small>
+    </div>
+  </form>
 
 EVENTS_HTML = """
 <!doctype html>
